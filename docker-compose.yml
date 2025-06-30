@@ -1,0 +1,50 @@
+services:
+  # The Go application for data ingestion
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oriontrader
+    # Mount the local directory to see code changes without rebuilding the image
+    volumes:
+      - .:/app
+    # Pass Alpaca and MinIO credentials securely as environment variables
+    env_file:
+      - .env
+    # Depend on MinIO to ensure it starts first
+    depends_on:
+      - minio
+    networks:
+      - oriontrader_net
+
+  # MinIO service to act as our local S3-compatible object storage
+  minio:
+    image: minio/minio:RELEASE.2024-06-22T05-26-45Z
+    container_name: minio
+    ports:
+      # Expose API port 9000 and Console port 9001
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    # Use environment variables to set root user and password for MinIO
+    env_file:
+      - .env
+    # The command to start the MinIO server and create the console
+    command: server /data --console-address ":9001"
+    networks:
+      - oriontrader_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+# Define the network for our services to communicate
+networks:
+  oriontrader_net:
+    driver: bridge
+
+# Define the volume for persistent MinIO data
+volumes:
+  minio_data:
