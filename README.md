@@ -56,3 +56,10 @@ Follow these steps to get the OrionTrader pipeline up and running.
 git clone <your-repo-url>
 cd <your-repo-directory>
 ```
+
+## TODO
+
+- change MinIO writes to be batched
+- more robust testing of indicators
+- more robust benchmarking
+- tests for concurrency
