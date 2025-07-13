@@ -8,86 +8,109 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
-	_ "net/http/pprof" // Import pprof for side effects: it registers handlers on the default serve mux
+	"net/url"
 	"os"
 	"os/signal"
-	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"runtime"
 
-	//"github.com/cinar/indicator/v2/trend" // Correctly referencing v2
+	_ "net/http/pprof"
+
+	"github.com/cinar/indicator"
+	"github.com/go-playground/validator/v10"
 	"github.com/joho/godotenv"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"golang.org/x/time/rate"
 )
 
-// --- Globals for Goroutine Monitoring ---
+// Monitoring globals
 var (
-	fetcherGoroutines   atomic.Int64
-	processorGoroutines atomic.Int64
+	fetchWorkers      atomic.Int64
+	processWorkers    atomic.Int64
+	totalSymbols      atomic.Int64
+	fetchedSymbols    atomic.Int64
+	processedSymbols  atomic.Int64
+	fetchFailures     atomic.Int64
+	processFailures   atomic.Int64
 )
 
-// AppConfig holds the configuration for the application.
+// AppConfig holds application configuration
 type AppConfig struct {
-	PolygonAPIKey      string
 	MinIOEndpoint      string
 	MinIOAccessKey     string
 	MinIOSecretKey     string
 	MinIOUseSSL        bool
-	RawDataBucketName  string
 	FeaturesBucketName string
+	AlpacaKey          string
+	AlpacaSecret       string
 }
 
-// PolygonBar represents a single bar from the Polygon.io Aggregates API.
-type PolygonBar struct {
-	Open      float64 `json:"o"`
-	High      float64 `json:"h"`
-	Low       float64 `json:"l"`
-	Close     float64 `json:"c"`
-	Volume    float64 `json:"v"`
-	Timestamp int64   `json:"t"` // Unix Msec
+// Asset represents an Alpaca asset
+type Asset struct {
+	AlpacaID                    string   `json:"id" validate:"required"`
+	Class                       string   `json:"class" validate:"required,oneof=us_equity us_option crypto"`
+	Cusip                       *string  `json:"cusip"`
+	Exchange                    string   `json:"exchange" validate:"required,oneof=AMEX ARCA BATS NYSE NASDAQ NYSEARCA OTC"`
+	Symbol                      string   `json:"symbol" validate:"required"`
+	Name                        string   `json:"name" validate:"required,min=1"`
+	Status                      string   `json:"status" validate:"required,oneof=active inactive"`
+	Tradable                    bool     `json:"tradable" validate:"required"`
+	Marginable                  bool     `json:"marginable" validate:"required"`
+	Shortable                   bool     `json:"shortable" validate:"required"`
+	EasyToBorrow                bool     `json:"easy_to_borrow" validate:"required"`
+	Fractionable                bool     `json:"fractionable" validate:"required"`
+	MarginRequirementLong       string   `json:"margin_requirement_long"`
+	MarginRequirementShort      string   `json:"margin_requirement_short"`
+	Attributes                  []string `json:"attributes" validate:"dive,oneof=ptp_no_exception ptp_with_exception ipo has_options options_late_close"`
 }
 
-// PriceDataResponse is the structure of the JSON response from Polygon.io for prices.
-type PriceDataResponse struct {
-	Ticker  string       `json:"ticker"`
-	Results []PolygonBar `json:"results"`
-	Status  string       `json:"status"`
+// Bar represents a single price bar
+type Bar struct {
+	Open      float64 `validate:"gt=0"`
+	High      float64 `validate:"gt=0"`
+	Low       float64 `validate:"gt=0"`
+	Close     float64 `validate:"gt=0"`
+	Volume    float64 `validate:"gte=0"`
+	Timestamp int64   `validate:"required"`
 }
 
-// NewsArticle represents a single news article from the Polygon.io News API.
-type NewsArticle struct {
-	Title      string `json:"title"`
-	Published  string `json:"published_utc"`
-	ArticleURL string `json:"article_url"`
-	Sentiment  struct {
-		Polarity float64 `json:"polarity"`
-	} `json:"sentiment"`
-}
-
-// NewsResponse is the structure for the news API call.
-type NewsResponse struct {
-	Results []NewsArticle `json:"results"`
-	NextURL string        `json:"next_url"`
-}
-
-// FetchedData is expanded to hold all the raw data for a ticker before processing.
+// FetchedData holds price data for a symbol
 type FetchedData struct {
 	Symbol    string
-	PriceData PriceDataResponse
-	NewsData  []NewsArticle
+	PriceData []Bar
 }
 
+// Job represents a fetch task
+type Job struct {
+	Symbol string
+}
+
+var (
+	validate     *validator.Validate
+	vixMap       = make(map[string]float64) // date -> VIXY close
+	tradingURL   = "https://paper-api.alpaca.markets/v2/"
+	dataURL      = "https://data.alpaca.markets/v2/"
+	rateLimiter  = rate.NewLimiter(rate.Every(300*time.Millisecond), 1) // 200 req/min
+	fetchQueue   = make(chan Job, 1000)
+	processQueue = make(chan FetchedData, 1000)
+)
+
 func main() {
-	log.Println("Starting OrionTrader Data Engineering Pipeline...")
+	validate = validator.New(validator.WithRequiredStructEnabled())
+	log.Println("Starting OrionTrader Data Pipeline...")
 
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("FATAL: Could not load configuration: %v", err)
+		log.Fatalf("FATAL: Could not load config: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -97,15 +120,12 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("Shutdown signal received. Cleaning up...")
+		log.Println("Shutdown signal received...")
 		cancel()
 	}()
 
 	go startPprofServer()
 	go startMonitoring(ctx)
-
-	rawDataChan := make(chan FetchedData, 100)
-	var wg sync.WaitGroup
 
 	minioClient, err := minio.New(cfg.MinIOEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
@@ -114,334 +134,395 @@ func main() {
 	if err != nil {
 		log.Fatalf("FATAL: Could not connect to MinIO: %v", err)
 	}
-	log.Println("Successfully connected to MinIO.")
+	log.Println("Connected to MinIO.")
 	setupMinIOBuckets(ctx, minioClient, cfg)
 
-	wg.Add(1)
-	//go processData(ctx, &wg, rawDataChan, minioClient, cfg)
-
-	wg.Add(1)
-	go fetchTickers(ctx, &wg, rawDataChan, cfg)
+	var wg sync.WaitGroup
+	startProcessors(ctx, &wg, minioClient, cfg)
+	startFetchers(ctx, &wg, cfg)
+	fetchAssetsAndQueueJobs(ctx, cfg)
 
 	<-ctx.Done()
-
-	log.Println("Waiting for all workers to finish...")
-	close(rawDataChan)
+	log.Println("Waiting for workers to finish...")
+	close(fetchQueue)
+	close(processQueue)
 	wg.Wait()
-	log.Println("OrionTrader pipeline shutdown complete.")
+
+	// Log final report in red
+	log.Printf("\033[31m[FINAL REPORT] Total Symbols: %d | Fetched: %d | Processed: %d | Fetch Failures: %d | Process Failures: %d | Success Rate: %.2f%%\033[0m",
+		totalSymbols.Load(), fetchedSymbols.Load(), processedSymbols.Load(), fetchFailures.Load(), processFailures.Load(),
+		float64(processedSymbols.Load())/float64(totalSymbols.Load())*100)
 }
 
 func loadConfig() (*AppConfig, error) {
 	if err := godotenv.Load(); err != nil {
-		log.Println("WARN: .env file not found, relying on environment variables.")
+		log.Println("WARN: .env not found, using env vars.")
 	}
 	return &AppConfig{
-		PolygonAPIKey:      os.Getenv("POLYGON_API_KEY"),
 		MinIOEndpoint:      os.Getenv("MINIO_ENDPOINT"),
 		MinIOAccessKey:     os.Getenv("MINIO_ROOT_USER"),
 		MinIOSecretKey:     os.Getenv("MINIO_ROOT_PASSWORD"),
 		MinIOUseSSL:        os.Getenv("MINIO_USE_SSL") == "true",
-		RawDataBucketName:  "raw-market-data",
 		FeaturesBucketName: "features-market-data",
+		AlpacaKey:          os.Getenv("ALPACA_API_KEY"),
+		AlpacaSecret:       os.Getenv("ALPACA_API_SECRET"),
 	}, nil
 }
 
-// fetchTickers now orchestrates fetching prices, news, and the VIX index.
-func fetchTickers(ctx context.Context, wg *sync.WaitGroup, rawDataChan chan<- FetchedData, cfg *AppConfig) {
-	defer wg.Done()
-	log.Println("Starting data fetcher with rate limiting (5 calls/minute)...")
-
-	tickers := []string{"SPY", "QQQ", "AAPL", "MSFT", "GOOG", "NVDA", "TSLA"}
-	var fetchWg sync.WaitGroup
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	rateLimiter := time.NewTicker(12 * time.Second)
-	defer rateLimiter.Stop()
-
-	from := "2024-10-01"
-	to := "2024-12-31"
-	vixPriceData, err := fetchVixData(ctx, rateLimiter, client, cfg, from, to)
+func fetchAssetsAndQueueJobs(ctx context.Context, cfg *AppConfig) {
+	client := &http.Client{}
+	resp, err := doRequest(client, "GET", tradingURL+"assets", url.Values{
+		"status":      {"active"},
+		"asset_class": {"us_equity"},
+	}, cfg, false)
 	if err != nil {
-		log.Printf("FATAL: Could not fetch VIX data, aborting pipeline: %v", err)
-		return
+		log.Fatalf("FATAL: Failed to fetch assets: %v", err)
+	}
+	defer resp.Body.Close()
+	var assets []Asset
+	if err := json.NewDecoder(resp.Body).Decode(&assets); err != nil {
+		log.Fatalf("FATAL: Failed to decode assets: %v", err)
+	}
+	var symbols []string
+	for _, a := range assets {
+		if a.Tradable {
+			symbols = append(symbols, a.Symbol)
+		}
+	}
+	totalSymbols.Store(int64(len(symbols)))
+	log.Printf("Found %d tradable symbols.", len(symbols))
+
+	// Fetch VIXY data
+	if err := fetchVixData(client, cfg); err != nil {
+		log.Printf("WARN: Failed to fetch VIXY: %v", err)
 	}
 
-	// Send VIX data FIRST to ensure it's processed before any tickers.
-	log.Println("Sending VIX data to processor...")
-	vixAsPriceData := PriceDataResponse{Ticker: "VIX", Results: vixPriceData}
-	rawDataChan <- FetchedData{Symbol: "VIX_DATA_SIGNAL", PriceData: vixAsPriceData}
-
-	for _, ticker := range tickers {
-		fetchWg.Add(1)
-		go func(t string) {
-			fetcherGoroutines.Add(1)
-			defer fetcherGoroutines.Add(-1)
-			defer fetchWg.Done()
-
-			<-rateLimiter.C
-			log.Printf("Fetching price data for %s...", t)
-			priceData, err := fetchPriceData(ctx, client, cfg, t, from, to)
-			if err != nil {
-				log.Printf("ERROR: Failed to fetch price data for %s: %v", t, err)
-				return
-			}
-			if len(priceData.Results) == 0 {
-				log.Printf("WARN: No price data returned for ticker %s", t)
-				return
-			}
-
-			<-rateLimiter.C
-			log.Printf("Fetching news data for %s...", t)
-			newsData, err := fetchNewsData(ctx, client, cfg, t, from, to)
-			if err != nil {
-				log.Printf("WARN: Could not fetch news data for %s: %v", t, err)
-			}
-
-			dataPayload := FetchedData{
-				Symbol:    t,
-				PriceData: *priceData,
-				NewsData:  newsData,
-			}
-
-			select {
-			case <-ctx.Done():
-				log.Printf("Fetcher shutting down while preparing data for %s.", t)
-				return
-			case rawDataChan <- dataPayload:
-				log.Printf("Successfully fetched and queued all data for %s", t)
-			}
-		}(ticker)
+	// Queue symbols
+	for _, s := range symbols {
+		select {
+		case fetchQueue <- Job{Symbol: s}:
+		case <-ctx.Done():
+			return
+		}
 	}
-
-	fetchWg.Wait()
-	log.Println("Fetcher finished its run.")
 }
 
-// processData now integrates VIX and News Sentiment into the feature CSV.
-func processData(ctx context.Context, wg *sync.WaitGroup, rawDataChan <-chan FetchedData, minioClient *minio.Client, cfg *AppConfig) {
-	defer wg.Done()
-	log.Println("Starting data processor...")
-
-	var processWg sync.WaitGroup
-	vixDataMap := make(map[string]float64)
-	var vixMutex sync.RWMutex // Mutex to protect the VIX map
-
-	for fetchedData := range rawDataChan {
-		if fetchedData.Symbol == "VIX_DATA_SIGNAL" {
-			log.Println("Processor received VIX data.")
-			vixMutex.Lock() // Lock for writing
-			for _, bar := range fetchedData.PriceData.Results {
-				date := time.Unix(bar.Timestamp/1000, 0).Format("2006-01-02")
-				vixDataMap[date] = bar.Close
-			}
-			vixMutex.Unlock()
-			continue
-		}
-
-		processWg.Add(1)
-		go func(data FetchedData) {
-			processorGoroutines.Add(1)
-			defer processorGoroutines.Add(-1)
-			defer processWg.Done()
-
-			log.Printf("Processing and feature engineering for %s...", data.Symbol)
-			bars := data.PriceData.Results
-			if len(bars) < 50 { // Increased lookback for EMA50
-				log.Printf("WARN: Skipping %s due to insufficient data (%d bars) for EMA50", data.Symbol, len(bars))
-				return
-			}
-
-			newsSentimentMap := make(map[string]float64)
-			dailyScores := make(map[string][]float64)
-			for _, article := range data.NewsData {
-				// Use RFC3339Nano for more robust time parsing from Polygon
-				parsedTime, err := time.Parse(time.RFC3339Nano, article.Published)
+func startFetchers(ctx context.Context, wg *sync.WaitGroup, cfg *AppConfig) {
+	const numFetchers = 10
+	for i := 0; i < numFetchers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			fetchWorkers.Add(1)
+			defer fetchWorkers.Add(-1)
+			log.Printf("Fetcher %d started.", id)
+			client := &http.Client{}
+			retryClients := make(map[string]*http.Client)
+			retryCounts := make(map[string]int)
+			for job := range fetchQueue {
+				if err := rateLimiter.Wait(ctx); err != nil {
+					return
+				}
+				data, err := fetchBars(client, job.Symbol, cfg, retryClients, retryCounts)
 				if err != nil {
+					log.Printf("ERROR: Fetch failed for %s: %v", job.Symbol, err)
+					fetchFailures.Add(1)
 					continue
 				}
-				dateStr := parsedTime.Format("2006-01-02")
-				dailyScores[dateStr] = append(dailyScores[dateStr], article.Sentiment.Polarity)
-			}
-			for date, scores := range dailyScores {
-				var sum float64
-				for _, score := range scores {
-					sum += score
+				fetchedSymbols.Add(1)
+				select {
+				case processQueue <- data:
+				case <-ctx.Done():
+					return
 				}
-				newsSentimentMap[date] = sum / float64(len(scores))
 			}
-
-			var closePrices []float64
-			for _, bar := range bars {
-				closePrices = append(closePrices, bar.Close)
-			}
-
-			// *** FIX: Corrected function calls to match `cinar/indicator/v2` API ***
-			//sma20 := trend.SMA20(20, closePrices)
-			//ema50 := trend.EMA50(50, closePrices)
-			//rsi14 := trend.RSI14(14, closePrices)
-			//macd, macdSignal := trend.MACDSignal(12, 26, 9, closePrices)
-			//bbUpper, bbMiddle, bbLower := trend.BBUpper(20, closePrices), trend.BBMiddle(20, closePrices), trend.BBLower(20, closePrices)
-
-			var buffer bytes.Buffer
-			writer := csv.NewWriter(&buffer)
-			newHeader := []string{"Date", "Open", "High", "Low", "Close", "Volume", "VIX_Close", "News_Sentiment_Avg"}
-			writer.Write(newHeader)
-
-			for _, bar := range bars {
-				dateStr := time.Unix(bar.Timestamp/1000, 0).Format("2006-01-02")
-
-				vixMutex.RLock() // Read lock for safety when accessing the map from concurrent goroutines
-				vixClose := formatFloat(vixDataMap[dateStr])
-				vixMutex.RUnlock()
-
-				newsSentiment := formatFloat(newsSentimentMap[dateStr])
-
-				row := []string{
-					dateStr,
-					strconv.FormatFloat(bar.Open, 'f', 2, 64),
-					strconv.FormatFloat(bar.High, 'f', 2, 64),
-					strconv.FormatFloat(bar.Low, 'f', 2, 64),
-					strconv.FormatFloat(bar.Close, 'f', 2, 64),
-					strconv.FormatFloat(bar.Volume, 'f', 0, 64),
-					//formatFloat(sma20[i]),
-					//formatFloat(ema50[i]),
-					//formatFloat(rsi14[i]),
-					//formatFloat(macd[i]),
-					//formatFloat(macdSignal[i]),
-					//formatFloat(bbUpper[i]),
-					//formatFloat(bbMiddle[i]),
-					//formatFloat(bbLower[i]),
-					vixClose,
-					newsSentiment,
-				}
-				writer.Write(row)
-			}
-			writer.Flush()
-
-			objectName := fmt.Sprintf("%s/%s-features.csv", data.Symbol, time.Now().Format("2006-01-02"))
-			_, err := minioClient.PutObject(ctx, cfg.FeaturesBucketName, objectName, &buffer, int64(buffer.Len()), minio.PutObjectOptions{ContentType: "text/csv"})
-			if err != nil {
-				log.Printf("ERROR: Failed to upload features for %s: %v", data.Symbol, err)
-				return
-			}
-			log.Printf("Successfully uploaded features for %s to MinIO.", data.Symbol)
-		}(fetchedData)
+			log.Printf("Fetcher %d stopped.", id)
+		}(i)
 	}
-
-	processWg.Wait()
-	log.Println("Processor finished handling all data.")
 }
 
-// --- Monitoring & Diagnostics (Unchanged) ---
+func startProcessors(ctx context.Context, wg *sync.WaitGroup, minioClient *minio.Client, cfg *AppConfig) {
+	const numProcessors = 10
+	for i := 0; i < numProcessors; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			processWorkers.Add(1)
+			defer processWorkers.Add(-1)
+			log.Printf("Processor %d started.", id)
+			for data := range processQueue {
+				if err := processAndSave(ctx, data, minioClient, cfg); err != nil {
+					log.Printf("ERROR: Processing failed for %s: %v", data.Symbol, err)
+					processFailures.Add(1)
+					continue
+				}
+				processedSymbols.Add(1)
+				log.Printf("Processed %s. Total: %d/%d", data.Symbol, processedSymbols.Load(), totalSymbols.Load())
+			}
+			log.Printf("Processor %d stopped.", id)
+		}(i)
+	}
+}
+
+func doRequest(client *http.Client, method, urlStr string, params url.Values, cfg *AppConfig, retry bool) (*http.Response, error) {
+	u := urlStr
+	if params != nil {
+		u += "?" + params.Encode()
+	}
+	req, err := http.NewRequest(method, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("APCA-API-KEY-ID", cfg.AlpacaKey)
+	req.Header.Set("APCA-API-SECRET-KEY", cfg.AlpacaSecret)
+	resp, err := client.Do(req)
+	if err != nil {
+		if retry {
+			return nil, fmt.Errorf("network error: %w", err)
+		}
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if retry && resp.StatusCode >= 500 {
+			return nil, fmt.Errorf("server error (status: %s): %s", resp.Status, string(body))
+		}
+		return nil, fmt.Errorf("request failed (status: %s): %s", resp.Status, string(body))
+	}
+	return resp, nil
+}
+
+func fetchVixData(client *http.Client, cfg *AppConfig) error {
+	resp, err := doRequest(client, "GET", dataURL+"stocks/bars", url.Values{
+		"symbols":    {"VIXY"},
+		"timeframe":  {"1Day"},
+		"start":      {"2023-01-01"},
+		"end":        {"2023-12-31"},
+		"limit":      {"10000"},
+		"adjustment": {"all"},
+	}, cfg, false)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Bars map[string][]struct {
+			T string  `json:"t"`
+			C float64 `json:"c"`
+		} `json:"bars"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+	for _, b := range result.Bars["VIXY"] {
+		ts, err := time.Parse(time.RFC3339, b.T)
+		if err != nil {
+			continue
+		}
+		vixMap[ts.Format("2006-01-02")] = b.C
+	}
+	log.Println("Fetched VIXY data.")
+	return nil
+}
+
+func fetchBars(client *http.Client, symbol string, cfg *AppConfig, retryClients map[string]*http.Client, retryCounts map[string]int) (FetchedData, error) {
+	resp, err := doRequest(client, "GET", dataURL+"stocks/bars", url.Values{
+		"symbols":    {symbol},
+		"timeframe":  {"1Day"},
+		"start":      {"2023-01-01"},
+		"end":        {"2023-12-31"},
+		"limit":      {"10000"},
+		"adjustment": {"all"},
+	}, cfg, true)
+	if err != nil {
+		if retryCounts[symbol] < 3 && !strings.Contains(err.Error(), "status: 4") {
+			retryCounts[symbol]++
+			if retryClients[symbol] == nil {
+				retryClients[symbol] = &http.Client{}
+			}
+			log.Printf("Retrying fetch for %s (attempt %d)", symbol, retryCounts[symbol])
+			return fetchBars(retryClients[symbol], symbol, cfg, retryClients, retryCounts)
+		}
+		return FetchedData{}, err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Bars map[string][]struct {
+			T string  `json:"t"`
+			O float64 `json:"o"`
+			H float64 `json:"h"`
+			L float64 `json:"l"`
+			C float64 `json:"c"`
+			V float64 `json:"v"`
+		} `json:"bars"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return FetchedData{}, err
+	}
+	bars, ok := result.Bars[symbol]
+	if !ok {
+		return FetchedData{}, fmt.Errorf("no data for %s", symbol)
+	}
+	var priceData []Bar
+	for _, b := range bars {
+		ts, err := time.Parse(time.RFC3339, b.T)
+		if err != nil {
+			continue
+		}
+		bar := Bar{
+			Open:      b.O,
+			High:      b.H,
+			Low:       b.L,
+			Close:     b.C,
+			Volume:    b.V,
+			Timestamp: ts.UnixNano(),
+		}
+		if err := validate.Struct(&bar); err != nil {
+			continue
+		}
+		priceData = append(priceData, bar)
+	}
+	sort.Slice(priceData, func(i, j int) bool {
+		return priceData[i].Timestamp < priceData[j].Timestamp
+	})
+	return FetchedData{Symbol: symbol, PriceData: priceData}, nil
+}
+
+func processAndSave(ctx context.Context, data FetchedData, minioClient *minio.Client, cfg *AppConfig) error {
+	if len(data.PriceData) < 50 {
+		return fmt.Errorf("insufficient data for %s (%d bars)", data.Symbol, len(data.PriceData))
+	}
+
+	var opens, highs, lows, closes, volumes []float64
+	for _, bar := range data.PriceData {
+		opens = append(opens, bar.Open)
+		highs = append(highs, bar.High)
+		lows = append(lows, bar.Low)
+		closes = append(closes, bar.Close)
+		volumes = append(volumes, bar.Volume)
+	}
+
+	for i, c := range closes {
+		if math.IsNaN(c) || math.IsInf(c, 0) {
+			if i > 0 {
+				closes[i] = closes[i-1]
+			} else {
+				closes[i] = 0
+			}
+		}
+	}
+
+	sma20 := indicator.Sma(20, closes)
+	ema50 := indicator.Ema(50, closes)
+	rsi14, _ := indicator.Rsi(closes)
+	macd, macdSignal := indicator.Macd(closes)
+	bbUpper, bbMiddle, bbLower := indicator.BollingerBands(closes)
+	atr, _ := indicator.Atr(14, highs, lows, closes)
+	obv := indicator.Obv(closes, volumes)
+	adx := padIndicator(Adx(14, highs, lows, closes), len(closes), 14)
+	cci := padIndicator(Cci(20, highs, lows, closes), len(closes), 20)
+	stochK, stochD := indicator.StochasticOscillator(highs, lows, closes)
+	vwap := Vwap(closes, volumes)
+	roc := padIndicator(Roc(12, closes), len(closes), 12)
+	cmo := padIndicator(Cmo(14, closes), len(closes), 14)
+
+	var rows [][]string
+	for i, bar := range data.PriceData {
+		date := time.Unix(0, bar.Timestamp).Format("2006-01-02")
+		row := []string{
+			date,
+			strconv.FormatFloat(bar.Open, 'f', 2, 64),
+			strconv.FormatFloat(bar.High, 'f', 2, 64),
+			strconv.FormatFloat(bar.Low, 'f', 2, 64),
+			strconv.FormatFloat(bar.Close, 'f', 2, 64),
+			strconv.FormatFloat(bar.Volume, 'f', 0, 64),
+			formatFloat(sma20[i]),
+			formatFloat(ema50[i]),
+			formatFloat(rsi14[i]),
+			formatFloat(macd[i]),
+			formatFloat(macdSignal[i]),
+			formatFloat(bbUpper[i]),
+			formatFloat(bbMiddle[i]),
+			formatFloat(bbLower[i]),
+			formatFloat(atr[i]),
+			formatFloat(obv[i]),
+			formatFloat(adx[i]),
+			formatFloat(cci[i]),
+			formatFloat(stochK[i]),
+			formatFloat(stochD[i]),
+			formatFloat(vwap[i]),
+			formatFloat(roc[i]),
+			formatFloat(cmo[i]),
+			formatFloat(vixMap[date]),
+			//formatFloat(data.Sentiments[date]),
+		}
+		rows = append(rows, row)
+	}
+
+	objectName := fmt.Sprintf("%s/historical-features.csv", data.Symbol)
+	var buffer bytes.Buffer
+	writer := csv.NewWriter(&buffer)
+	exists := false
+	if _, err := minioClient.StatObject(ctx, cfg.FeaturesBucketName, objectName, minio.StatObjectOptions{}); err == nil {
+		exists = true
+		obj, err := minioClient.GetObject(ctx, cfg.FeaturesBucketName, objectName, minio.GetObjectOptions{})
+		if err != nil {
+			return err
+		}
+		defer obj.Close()
+		_, err = io.Copy(&buffer, obj)
+		if err != nil {
+			return err
+		}
+	} else if minio.ToErrorResponse(err).Code != "NoSuchKey" {
+		return err
+	}
+	if !exists {
+		writer.Write([]string{"Date", "Open", "High", "Low", "Close", "Volume", "SMA20", "EMA50", "RSI14", "MACD", "MACDSignal", "BBUpper", "BBMiddle", "BBLower", "ATR14", "OBV", "ADX14", "CCI20", "StochK", "StochD", "VWAP", "ROC12", "CMO14", "VIX" /*, "Sentiment"*/})
+	}
+	for _, row := range rows {
+		writer.Write(row)
+	}
+	writer.Flush()
+	_, err := minioClient.PutObject(ctx, cfg.FeaturesBucketName, objectName, &buffer, int64(buffer.Len()), minio.PutObjectOptions{ContentType: "text/csv"})
+	return err
+}
+
+// Monitoring & Helpers
 func startMonitoring(ctx context.Context) {
-	log.Printf("Starting goroutine monitor. Logical CPUs available: %d", runtime.GOMAXPROCS(0))
-	ticker := time.NewTicker(1 * time.Minute)
+	log.Printf("Monitoring started. CPUs: %d", runtime.NumCPU())
+	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			log.Printf("[MONITOR] Total Goroutines: %d | Fetchers: %d | Processors: %d", runtime.NumGoroutine(), fetcherGoroutines.Load(), processorGoroutines.Load())
+			log.Printf("[MONITOR] Fetchers: %d | Processors: %d | Fetched: %d/%d | Processed: %d/%d | Fetch Failures: %d | Process Failures: %d",
+				fetchWorkers.Load(), processWorkers.Load(), fetchedSymbols.Load(), totalSymbols.Load(), processedSymbols.Load(), totalSymbols.Load(), fetchFailures.Load(), processFailures.Load())
 		case <-ctx.Done():
-			log.Println("Stopping goroutine monitor.")
+			log.Println("Monitoring stopped.")
 			return
 		}
 	}
 }
 
 func startPprofServer() {
-	log.Println("Starting pprof server on :6060. Access http://localhost:6060/debug/pprof/")
+	log.Println("pprof server on :6060")
 	if err := http.ListenAndServe(":6060", nil); err != nil {
-		log.Fatalf("FATAL: pprof server failed to start: %v", err)
+		log.Fatalf("FATAL: pprof failed: %v", err)
 	}
-}
-
-// --- Helper & Fetcher Functions ---
-func fetchPriceData(ctx context.Context, client *http.Client, cfg *AppConfig, ticker, from, to string) (*PriceDataResponse, error) {
-	url := fmt.Sprintf("https://api.polygon.io/v2/aggs/ticker/%s/range/1/day/%s/%s?adjusted=true&sort=asc&apiKey=%s", ticker, from, to, cfg.PolygonAPIKey)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("received non-200 status: %s. Body: %s", resp.Status, string(body))
-	}
-
-	var data PriceDataResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON: %w", err)
-	}
-	return &data, nil
-}
-
-func fetchVixData(ctx context.Context, rateLimiter *time.Ticker, client *http.Client, cfg *AppConfig, from, to string) ([]PolygonBar, error) {
-	log.Println("Fetching VIX data...")
-	<-rateLimiter.C
-	vixData, err := fetchPriceData(ctx, client, cfg, "I:VIX", from, to)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("Successfully fetched %d data points for VIX.", len(vixData.Results))
-	return vixData.Results, nil
-}
-
-func fetchNewsData(ctx context.Context, client *http.Client, cfg *AppConfig, ticker, from, to string) ([]NewsArticle, error) {
-	var allArticles []NewsArticle
-	url := fmt.Sprintf("https://api.polygon.io/v2/reference/news?ticker=%s&published_utc.gte=%s&published_utc.lte=%s&limit=100&apiKey=%s", ticker, from, to, cfg.PolygonAPIKey)
-
-	for url != "" {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("news API returned non-200 status: %s", resp.Status)
-		}
-
-		var newsResp NewsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&newsResp); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		resp.Body.Close()
-
-		allArticles = append(allArticles, newsResp.Results...)
-		url = newsResp.NextURL
-		if url != "" {
-			url += "&apiKey=" + cfg.PolygonAPIKey
-		}
-	}
-	return allArticles, nil
 }
 
 func setupMinIOBuckets(ctx context.Context, client *minio.Client, cfg *AppConfig) {
-	buckets := []string{cfg.RawDataBucketName, cfg.FeaturesBucketName}
-	for _, bucket := range buckets {
-		err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
-		if err != nil {
-			exists, errBucketExists := client.BucketExists(ctx, bucket)
-			if errBucketExists == nil && exists {
-				log.Printf("Bucket '%s' already exists.", bucket)
-			} else {
-				log.Fatalf("FATAL: Could not create or verify bucket '%s': %v", bucket, err)
-			}
+	err := client.MakeBucket(ctx, cfg.FeaturesBucketName, minio.MakeBucketOptions{})
+	if err != nil {
+		if exists, err := client.BucketExists(ctx, cfg.FeaturesBucketName); err == nil && exists {
+			log.Printf("Bucket '%s' exists.", cfg.FeaturesBucketName)
 		} else {
-			log.Printf("Successfully created bucket '%s'.", bucket)
+			log.Fatalf("FATAL: Bucket setup failed: %v", err)
 		}
+	} else {
+		log.Printf("Created bucket '%s'.", cfg.FeaturesBucketName)
 	}
 }
 
@@ -450,4 +531,128 @@ func formatFloat(f float64) string {
 		return ""
 	}
 	return strconv.FormatFloat(f, 'f', 2, 64)
+}
+
+// Indicator Helpers
+func Vwap(closes, volumes []float64) []float64 {
+	if len(closes) != len(volumes) {
+		return nil
+	}
+	vwap := make([]float64, len(closes))
+	var cumVolume, cumPriceVolume float64
+	for i := 0; i < len(closes); i++ {
+		cumPriceVolume += closes[i] * volumes[i]
+		cumVolume += volumes[i]
+		if cumVolume == 0 {
+			vwap[i] = 0
+		} else {
+			vwap[i] = cumPriceVolume / cumVolume
+		}
+	}
+	return vwap
+}
+
+func Roc(period int, closes []float64) []float64 {
+	if len(closes) < period {
+		return nil
+	}
+	roc := make([]float64, len(closes))
+	for i := period; i < len(closes); i++ {
+		if closes[i-period] == 0 {
+			roc[i] = 0
+		} else {
+			roc[i] = (closes[i] - closes[i-period]) / closes[i-period] * 100
+		}
+	}
+	return roc
+}
+
+func Cmo(period int, closes []float64) []float64 {
+	if len(closes) < period+1 {
+		return nil
+	}
+	cmo := make([]float64, len(closes))
+	for i := period; i < len(closes); i++ {
+		var upSum, downSum float64
+		for j := 1; j <= period; j++ {
+			change := closes[i-j+1] - closes[i-j]
+			if change > 0 {
+				upSum += change
+			} else {
+				downSum += math.Abs(change)
+			}
+		}
+		if upSum+downSum == 0 {
+			cmo[i] = 0
+		} else {
+			cmo[i] = (upSum - downSum) / (upSum + downSum) * 100
+		}
+	}
+	return cmo
+}
+
+func Adx(period int, highs, lows, closes []float64) []float64 {
+	if len(highs) != len(lows) || len(lows) != len(closes) || len(closes) < period+1 {
+		return nil
+	}
+	adx := make([]float64, len(closes))
+	tr := make([]float64, len(closes))
+	plusDM := make([]float64, len(closes))
+	minusDM := make([]float64, len(closes))
+	for i := 1; i < len(closes); i++ {
+		dh := highs[i] - highs[i-1]
+		dl := lows[i-1] - lows[i]
+		plusDM[i] = math.Max(dh, 0)
+		if dh > dl {
+			minusDM[i] = 0
+		} else {
+			minusDM[i] = math.Max(dl, 0)
+		}
+		tr[i] = math.Max(highs[i]-lows[i], math.Max(math.Abs(highs[i]-closes[i-1]), math.Abs(lows[i]-closes[i-1])))
+	}
+	plusDI := indicator.Ema(period, indicator.Sma(period, plusDM)[period-1:])
+	minusDI := indicator.Ema(period, indicator.Sma(period, minusDM)[period-1:])
+	atr := indicator.Ema(period, indicator.Sma(period, tr)[period-1:])
+	for i := period; i < len(closes); i++ {
+		dx := 0.0
+		if atr[i-period+1] != 0 {
+			dx = math.Abs(plusDI[i-period+1]-minusDI[i-period+1]) / (plusDI[i-period+1]+minusDI[i-period+1]) * 100
+		}
+		adx[i] = dx
+	}
+	return indicator.Ema(period, adx[period:])
+}
+
+func Cci(period int, highs, lows, closes []float64) []float64 {
+	if len(highs) != len(lows) || len(lows) != len(closes) || len(closes) < period {
+		return nil
+	}
+	cci := make([]float64, len(closes))
+	typPrices := make([]float64, len(closes))
+	for i := 0; i < len(closes); i++ {
+		typPrices[i] = (highs[i] + lows[i] + closes[i]) / 3
+	}
+	smaTyp := indicator.Sma(period, typPrices)
+	for i := period - 1; i < len(closes); i++ {
+		meanDev := 0.0
+		for j := i - period + 1; j <= i; j++ {
+			meanDev += math.Abs(typPrices[j] - smaTyp[i])
+		}
+		meanDev /= float64(period)
+		if meanDev == 0 {
+			cci[i] = 0
+		} else {
+			cci[i] = (typPrices[i] - smaTyp[i]) / (0.015 * meanDev)
+		}
+	}
+	return cci
+}
+
+func padIndicator(ind []float64, fullLen, period int) []float64 {
+	if len(ind) == 0 {
+		return make([]float64, fullLen)
+	}
+	padded := make([]float64, fullLen)
+	copy(padded[fullLen-len(ind):], ind)
+	return padded
 }
