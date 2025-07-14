@@ -5,10 +5,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 )
 
 func main() {
+	cpus := runtime.NumCPU()
+	log.Printf("MaxCPUs available =============== %d", cpus)
+	runtime.GOMAXPROCS(cpus) // Maximize parallelism
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

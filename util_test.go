@@ -10,23 +10,11 @@ import (
 	"testing"
 )
 
-// TestDoRequest tests the DoRequest function for various scenarios
+// TestDoRequest tests the DoRequest function with RequestOptions
 func TestDoRequest(t *testing.T) {
-	// Sample AppConfig for tests
-	cfg := &AppConfig{
-		AlpacaKey:    "test-key",
-		AlpacaSecret: "test-secret",
-	}
-
-	// Test cases
 	tests := []struct {
 		name           string
-		method         string
-		url            string
-		params         url.Values
-		headers        map[string]string
-		body           io.Reader
-		retry          bool
+		opts           RequestOptions
 		serverResponse func(w http.ResponseWriter, r *http.Request)
 		wantStatus     int
 		wantBody       string
@@ -34,15 +22,18 @@ func TestDoRequest(t *testing.T) {
 		wantErrMsg     string
 	}{
 		{
-			name:   "successful GET request",
-			method: "GET",
-			url:    "/test",
-			params: url.Values{"key": {"value"}},
-			headers: map[string]string{
-				"Custom-Header": "test-value",
+			name: "successful GET request",
+			opts: RequestOptions{
+				Method: "GET",
+				URL:    "/test",
+				Params: url.Values{"key": []string{"value"}},
+				Headers: map[string]string{
+					"Custom-Header":       "test-value",
+					"APCA-API-KEY-ID":     "test-key",
+					"APCA-API-SECRET-KEY": "test-secret",
+				},
+				Retry: false,
 			},
-			body: nil,
-			retry: false,
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != "GET" {
 					t.Errorf("Expected method GET, got %s", r.Method)
@@ -67,13 +58,13 @@ func TestDoRequest(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:   "404 not found",
-			method: "GET",
-			url:    "/not-found",
-			params: nil,
-			headers: nil,
-			body:   nil,
-			retry:  false,
+			name: "404 not found",
+			opts: RequestOptions{
+				Method:  "GET",
+				URL:     "/not-found",
+				Headers: map[string]string{},
+				Retry:   false,
+			},
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 				fmt.Fprint(w, `{"error":"resource not found"}`)
@@ -82,13 +73,13 @@ func TestDoRequest(t *testing.T) {
 			wantErrMsg: "request failed (status: 404 Not Found): {\"error\":\"resource not found\"}",
 		},
 		{
-			name:   "500 server error with retry",
-			method: "GET",
-			url:    "/server-error",
-			params: nil,
-			headers: nil,
-			body:   nil,
-			retry:  true,
+			name: "500 server error with retry",
+			opts: RequestOptions{
+				Method:  "GET",
+				URL:     "/server-error",
+				Headers: map[string]string{},
+				Retry:   true,
+			},
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprint(w, `{"error":"internal server error"}`)
@@ -97,15 +88,18 @@ func TestDoRequest(t *testing.T) {
 			wantErrMsg: "server error (status: 500 Internal Server Error): {\"error\":\"internal server error\"}",
 		},
 		{
-			name:   "POST request with body",
-			method: "POST",
-			url:    "/post-test",
-			params: nil,
-			headers: map[string]string{
-				"Content-Type": "application/json",
+			name: "POST request with body",
+			opts: RequestOptions{
+				Method: "POST",
+				URL:    "/post-test",
+				Headers: map[string]string{
+					"Content-Type":        "application/json",
+					"APCA-API-KEY-ID":     "test-key",
+					"APCA-API-SECRET-KEY": "test-secret",
+				},
+				Body:  strings.NewReader(`{"data":"test"}`),
+				Retry: false,
 			},
-			body: strings.NewReader(`{"data":"test"}`),
-			retry: false,
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != "POST" {
 					t.Errorf("Expected method POST, got %s", r.Method)
@@ -125,15 +119,14 @@ func TestDoRequest(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:   "invalid method",
-			method: "INVALID",
-			url:    "/test",
-			params: nil,
-			headers: nil,
-			body:   nil,
-			retry:  false,
+			name: "invalid method",
+			opts: RequestOptions{
+				Method:  "INVALID",
+				URL:     "/test",
+				Headers: map[string]string{},
+				Retry:   false,
+			},
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
-				// Should not reach here
 				t.Error("Server should not be called for invalid method")
 			},
 			wantErr:    true,
@@ -143,14 +136,14 @@ func TestDoRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a test server
 			server := httptest.NewServer(http.HandlerFunc(tt.serverResponse))
 			defer server.Close()
 
-			// Make the request
-			resp, err := DoRequest(tt.method, cfg, server.URL+tt.url, tt.params, tt.headers, tt.body, tt.retry)
+			// Update URL to use test server
+			tt.opts.URL = server.URL + tt.opts.URL
 
-			// Check error
+			resp, err := DoRequest(tt.opts)
+
 			if (err != nil) != tt.wantErr {
 				t.Errorf("DoRequest() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -158,7 +151,6 @@ func TestDoRequest(t *testing.T) {
 				t.Errorf("DoRequest() error message = %v, want %v", err.Error(), tt.wantErrMsg)
 			}
 
-			// Check response for successful cases
 			if !tt.wantErr && resp != nil {
 				if resp.StatusCode != tt.wantStatus {
 					t.Errorf("DoRequest() status = %d, want %d", resp.StatusCode, tt.wantStatus)

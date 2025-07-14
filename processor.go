@@ -8,8 +8,8 @@ import (
 	"io"
 	"log"
 	"math"
+	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"oriontrader/indicador"
@@ -21,65 +21,53 @@ import (
 // MinIOClient defines the interface for MinIO operations
 type MinIOClient interface {
 	StatObject(ctx context.Context, bucket, object string, opts minio.StatObjectOptions) (minio.ObjectInfo, error)
-	GetObject(ctx context.Context, bucket, object string, opts minio.GetObjectOptions) (*minio.Object, error)
+	GetObject(ctx context.Context, bucket, object string, opts minio.GetObjectOptions) (io.ReadCloser, error)
 	PutObject(ctx context.Context, bucket, object string, reader io.Reader, objectSize int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 }
 
 // Processor handles data processing and storage
 type Processor struct {
-	Cfg          *AppConfig
-	MinIO        MinIOClient
-	processQueue chan FetchedData
-	failureQueue chan Failure
-	workers      atomic.Int64
+	ingestor *Ingestor
+	pool     *WorkerPool
 }
 
 // ProcessorInterface defines the methods for the Processor
 type ProcessorInterface interface {
-	Start(ctx context.Context, wg *sync.WaitGroup, ingestor *Ingestor)
+	Start(ctx context.Context, wg *sync.WaitGroup)
 }
 
 // NewProcessor initializes a new Processor
-func NewProcessor(cfg *AppConfig, minioClient MinIOClient, processQueue chan FetchedData, failureQueue chan Failure) *Processor {
+func NewProcessor(ingestor *Ingestor) *Processor {
 	return &Processor{
-		Cfg:          cfg,
-		MinIO:        minioClient,
-		processQueue: processQueue,
-		failureQueue: failureQueue,
+		ingestor: ingestor,
+		pool: NewWorkerPool("Processor", runtime.NumCPU(), ingestor.processQueue, func(ctx context.Context, id int, job interface{}) error {
+			data := job.(FetchedData)
+			log.Printf("Processor %d received data for %s with %d bars", id, data.Symbol, len(data.PriceData))
+			p := Processor{ingestor: ingestor}
+			if err := p.ProcessAndSave(ctx, data); err != nil {
+				select {
+				case ingestor.failureQueue <- Failure{Type: "process", Symbol: data.Symbol, Error: err}:
+				case <-ctx.Done():
+					log.Printf("Processor %d stopped sending failure for %s due to context cancellation", id, data.Symbol)
+					return ctx.Err()
+				}
+				return err
+			}
+			ingestor.processedSymbols.Add(1)
+			log.Printf("Processed %s. Total: %d/%d", data.Symbol, ingestor.processedSymbols.Load(), ingestor.totalSymbols.Load())
+			return nil
+		}),
 	}
 }
 
 // Start launches processor workers
-func (p *Processor) Start(ctx context.Context, wg *sync.WaitGroup, ingestor *Ingestor) {
-	const numProcessors = 10
-	for i := 0; i < numProcessors; i++ {
-		wg.Add(1)
-		go p.worker(ctx, wg, i, ingestor)
-	}
+func (p *Processor) Start(ctx context.Context, wg *sync.WaitGroup) {
+	p.pool.Start(ctx, wg)
 }
 
-func (p *Processor) worker(ctx context.Context, wg *sync.WaitGroup, id int, ingestor *Ingestor) {
-	defer wg.Done()
-	p.workers.Add(1)
-	defer p.workers.Add(-1)
-	log.Printf("Processor %d started.", id)
-
-	for data := range p.processQueue {
-		if err := p.processAndSave(ctx, data); err != nil {
-			select {
-			case p.failureQueue <- Failure{Type: "process", Symbol: data.Symbol, Error: err}:
-			case <-ctx.Done():
-				return
-			}
-			continue
-		}
-		ingestor.processedSymbols.Add(1)
-		log.Printf("Processed %s. Total: %d/%d", data.Symbol, ingestor.processedSymbols.Load(), ingestor.totalSymbols.Load())
-	}
-	log.Printf("Processor %d stopped.", id)
-}
-
-func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error {
+// ProcessAndSave processes data and queues it for upload
+func (p *Processor) ProcessAndSave(ctx context.Context, data FetchedData) error {
+	log.Printf("Processing %s with %d bars", data.Symbol, len(data.PriceData))
 	if len(data.PriceData) < 50 {
 		return fmt.Errorf("insufficient data for %s (%d bars)", data.Symbol, len(data.PriceData))
 	}
@@ -117,7 +105,6 @@ func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error 
 	roc := indicador.PadIndicator(indicador.Roc(12, closes), len(closes), 12)
 	cmo := indicador.PadIndicator(indicador.Cmo(14, closes), len(closes), 14)
 
-	// Group bars by year
 	rowsByYear := make(map[string][][]string)
 	for i, bar := range data.PriceData {
 		year := time.Unix(0, bar.Timestamp).Format("2006")
@@ -147,23 +134,20 @@ func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error 
 			indicador.FormatFloat(roc[i]),
 			indicador.FormatFloat(cmo[i]),
 			indicador.FormatFloat(vixMap[date]),
-			//indicador.FormatFloat(data.Sentiments[date]),
 		}
 		rowsByYear[year] = append(rowsByYear[year], row)
 	}
 
-	// Process each year's data
 	for year, rows := range rowsByYear {
 		objectName := fmt.Sprintf("%s/%s/features.csv", data.Symbol, year)
 		var buffer bytes.Buffer
 		writer := csv.NewWriter(&buffer)
 
-		// Check for existing file
 		existingDates := make(map[string]struct{})
 		exists := false
-		if _, err := p.MinIO.StatObject(ctx, p.Cfg.FeaturesBucketName, objectName, minio.StatObjectOptions{}); err == nil {
+		if _, err := p.ingestor.MinIO.StatObject(ctx, p.ingestor.Cfg.FeaturesBucketName, objectName, minio.StatObjectOptions{}); err == nil {
 			exists = true
-			obj, err := p.MinIO.GetObject(ctx, p.Cfg.FeaturesBucketName, objectName, minio.GetObjectOptions{})
+			obj, err := p.ingestor.MinIO.GetObject(ctx, p.ingestor.Cfg.FeaturesBucketName, objectName, minio.GetObjectOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to get existing object %s/%s: %w", data.Symbol, year, err)
 			}
@@ -175,7 +159,6 @@ func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error 
 				return fmt.Errorf("failed to read existing CSV %s/%s: %w", data.Symbol, year, err)
 			}
 
-			// Skip header and collect existing dates
 			for i, record := range records {
 				if i == 0 || len(record) == 0 {
 					continue
@@ -186,18 +169,16 @@ func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error 
 			return fmt.Errorf("failed to stat object %s/%s: %w", data.Symbol, year, err)
 		}
 
-		// Write header if new file
 		if !exists {
 			writer.Write([]string{
 				"Date", "Open", "High", "Low", "Close", "Volume",
 				"SMA20", "EMA50", "RSI14", "MACD", "MACDSignal",
 				"BBUpper", "BBMiddle", "BBLower", "ATR14", "OBV",
 				"ADX14", "CCI20", "StochK", "StochD", "VWAP",
-				"ROC12", "CMO14", "VIX" /*, "Sentiment"*/,
+				"ROC12", "CMO14", "VIX",
 			})
 		}
 
-		// Write only new rows
 		newRows := 0
 		for _, row := range rows {
 			if _, exists := existingDates[row[0]]; !exists {
@@ -211,17 +192,17 @@ func (p *Processor) processAndSave(ctx context.Context, data FetchedData) error 
 			return fmt.Errorf("failed to write CSV for %s/%s: %w", data.Symbol, year, err)
 		}
 
-		// Skip upload if no new rows
 		if newRows == 0 && exists {
 			log.Printf("No new data to append for %s/%s (all %d dates already exist)", data.Symbol, year, len(rows))
 			continue
 		}
 
-		_, err := p.MinIO.PutObject(ctx, p.Cfg.FeaturesBucketName, objectName, &buffer, int64(buffer.Len()), minio.PutObjectOptions{ContentType: "text/csv"})
-		if err != nil {
-			return fmt.Errorf("failed to upload %s/%s: %w", data.Symbol, year, err)
+		select {
+		case p.ingestor.uploadQueue <- UploadJob{ObjectName: objectName, Buffer: buffer}:
+			log.Printf("Queued upload for %s/%s with %d new rows", data.Symbol, year, newRows)
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		log.Printf("Appended %d new rows for %s/%s", newRows, data.Symbol, year)
 	}
 
 	return nil

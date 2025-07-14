@@ -13,6 +13,7 @@ SHELL := /bin/bash
 dev: .env
 	@echo "Starting development environment..."
 	docker-compose up --build -d
+	#docker-compose up --build -d
 
 # Stop and remove all services, networks, and volumes
 down:

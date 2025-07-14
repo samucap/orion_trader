@@ -63,3 +63,5 @@ cd <your-repo-directory>
 - more robust testing of indicators
 - more robust benchmarking
 - tests for concurrency
+- add more tests
+- verify feature calculations
