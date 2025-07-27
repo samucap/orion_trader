@@ -1,9 +1,13 @@
-
 FROM golang:1.24-alpine
+
+# Install build-base for pprof's graph view, which is useful but optional.
+# git is also useful for go modules that might fetch from git.
+RUN apk add --no-cache build-base git
+
+# Set the main working directory for the app.
 WORKDIR /app
 
 # Copy go.mod and go.sum files to leverage Docker's build cache.
-# This step only re-runs if these files change.
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -11,10 +15,9 @@ RUN go mod download
 COPY . .
 
 # Build the Go application.
-# -o /app/main specifies the output file name.
-# CGO_ENABLED=0 creates a static binary which is good for containers.
-# -ldflags="-s -w" strips debugging information to reduce binary size.
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/main .
+# FIX 1: Added the -o flag to explicitly name the output binary and place it in /app/main
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /oriontrader
 
 # The command to run when the container starts.
-CMD ["/app/main"]
+# FIX 2: Changed the path to the correct location inside the container.
+CMD ["/oriontrader"]
