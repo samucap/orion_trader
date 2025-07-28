@@ -41,9 +41,9 @@ func (wp *WorkerPool) worker(ctx context.Context, wg *sync.WaitGroup, id int) {
 	log.Printf("%s worker %d started.", wp.name, id)
 
 	switch queue := wp.queue.(type) {
-	case chan []string:
-		for batch := range queue {
-			if err := wp.workFn(ctx, id, batch); err != nil {
+	case chan FetchTask:
+		for task := range queue {
+			if err := wp.workFn(ctx, id, task); err != nil {
 				log.Printf("%s worker %d failed: %v", wp.name, id, err)
 			}
 		}

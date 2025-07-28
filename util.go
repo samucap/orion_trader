@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/go-playground/validator/v10"
 	"github.com/minio/minio-go/v7"
@@ -71,6 +72,13 @@ type Failure struct {
 type UploadJob struct {
 	ObjectName string
 	Buffer     bytes.Buffer // Pass by value, but small
+}
+
+// FetchTask for queuing fetch jobs with date range
+type FetchTask struct {
+	Symbols []string
+	Start   string
+	End     string
 }
 
 // RequestOptions defines parameters for an HTTP request
@@ -176,4 +184,14 @@ func formatFloat(f float64) string {
 		return ""
 	}
 	return fmt.Sprintf("%.2f", f)
+}
+
+// timeToNextFetch calculates duration to next fetch time (21:00 UTC)
+func timeToNextFetch() time.Duration {
+	now := time.Now().UTC()
+	target := time.Date(now.Year(), now.Month(), now.Day(), 21, 0, 0, 0, time.UTC)
+	if now.After(target) || now.Equal(target) {
+		target = target.Add(24 * time.Hour)
+	}
+	return target.Sub(now)
 }

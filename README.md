@@ -59,8 +59,10 @@ cd <your-repo-directory>
 
 ## TODO
 
+X - Go back 5 years and rolling fetches and calculations
+
 - change MinIO writes to be batched
-- more robust testing of indicators
+- NEED TO VERIFY indicators calculations
 - more robust benchmarking
 - tests for concurrency
 - add more tests

@@ -63,4 +63,4 @@ networks:
 # Define the volume for persistent MinIO data
 volumes:
   minio_data:
-  ollama_data:
+  #ollama_data:
