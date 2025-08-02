@@ -2,22 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
-	"runtime"
-	"sync"
-	"sort"
-	"time"
-	"encoding/json"
-	"strings"
 	"net/url"
 	"os"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Fetcher manages data fetching from Alpaca API
 type Fetcher struct {
 	ingestor *Ingestor
-	pool     *WorkerPool
+	pool     *WorkerPool[FetchTask]
 }
 
 // FetcherInterface defines the methods for the Fetcher
@@ -29,17 +29,16 @@ type FetcherInterface interface {
 func NewFetcher(ingestor *Ingestor) *Fetcher {
 	return &Fetcher{
 		ingestor: ingestor,
-		pool: NewWorkerPool("Fetcher", runtime.NumCPU(), ingestor.fetchQueue, func(ctx context.Context, id int, job interface{}) error {
-			task := job.(FetchTask)
-			log.Printf("Fetcher %d fetching batch of %d symbols from %s to %s", id, len(task.Symbols), task.Start, task.End)
+		pool: NewWorkerPool[FetchTask]("Fetcher", runtime.NumCPU(), ingestor.fetchQueue, func(ctx context.Context, id int, job FetchTask) error {
+			log.Printf("Fetcher %d fetching batch of %d symbols from %s to %s", id, len(job.Symbols), job.Start, job.End)
 			if err := ingestor.rateLimiter.Wait(ctx); err != nil {
 				log.Printf("Fetcher %d stopped due to context cancellation: %v", id, err)
 				return err
 			}
 
-			dataMap, err := fetchBatch(&http.Client{}, task.Symbols, task.Start, task.End, ingestor)
+			dataMap, err := fetchBatch(&http.Client{}, job.Symbols, job.Start, job.End, ingestor)
 			if err != nil {
-				for _, symbol := range task.Symbols {
+				for _, symbol := range job.Symbols {
 					select {
 					case ingestor.failureQueue <- Failure{Type: "fetch", Symbol: symbol, Error: err}:
 					case <-ctx.Done():

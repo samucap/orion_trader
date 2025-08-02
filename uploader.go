@@ -13,22 +13,21 @@ import (
 // Uploader handles batched MinIO uploads
 type Uploader struct {
 	ingestor *Ingestor
-	pool     *WorkerPool
+	pool     *WorkerPool[UploadJob]
 }
 
 // NewUploader initializes a new Uploader
 func NewUploader(ingestor *Ingestor) *Uploader {
 	return &Uploader{
 		ingestor: ingestor,
-		pool: NewWorkerPool("Uploader", 2*runtime.NumCPU(), ingestor.uploadQueue, func(ctx context.Context, id int, job interface{}) error {
-			uploadJob := job.(UploadJob)
-			bufferReader := bytes.NewReader(uploadJob.Buffer.Bytes())
-			_, err := ingestor.MinIO.PutObject(ctx, ingestor.Cfg.FeaturesBucketName, uploadJob.ObjectName, bufferReader, int64(uploadJob.Buffer.Len()), minio.PutObjectOptions{ContentType: "text/csv"})
+		pool: NewWorkerPool[UploadJob]("Uploader", 2*runtime.NumCPU(), ingestor.uploadQueue, func(ctx context.Context, id int, job UploadJob) error {
+			bufferReader := bytes.NewReader(job.Buffer.Bytes())
+			_, err := ingestor.MinIO.PutObject(ctx, ingestor.Cfg.FeaturesBucketName, job.ObjectName, bufferReader, int64(job.Buffer.Len()), minio.PutObjectOptions{ContentType: "text/csv"})
 			if err != nil {
-				log.Printf("Uploader %d failed to upload %s: %v", id, uploadJob.ObjectName, err)
+				log.Printf("Uploader %d failed to upload %s: %v", id, job.ObjectName, err)
 				return err
 			}
-			log.Printf("Uploader %d uploaded %s", id, uploadJob.ObjectName)
+			log.Printf("Uploader %d uploaded %s", id, job.ObjectName)
 			return nil
 		}),
 	}
