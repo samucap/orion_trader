@@ -59,9 +59,13 @@ cd <your-repo-directory>
 
 ## TODO
 
-- change MinIO writes to be batched
-- more robust testing of indicators
+X - Go back 5 years and rolling fetches and calculations
+
+- need to verify continuous data fetch
+- For testing now you need to 'export GOEXPERIMENT=synctest'
+- Need to merge all the data fetching.
+- fix the DoRequest func signature, need to abstract some stuff so it's not so disorganized
+- finish testing the concurrency pipelines
+- NEED TO VERIFY indicators calculations
 - more robust benchmarking
-- tests for concurrency
-- add more tests
-- verify feature calculations
+- change MinIO writes to be batched

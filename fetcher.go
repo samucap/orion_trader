@@ -2,21 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
-	"runtime"
-	"sync"
-	"sort"
-	"time"
-	"encoding/json"
-	"strings"
 	"net/url"
+	"os"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Fetcher manages data fetching from Alpaca API
 type Fetcher struct {
 	ingestor *Ingestor
-	pool     *WorkerPool
+	pool     *WorkerPool[FetchTask]
 }
 
 // FetcherInterface defines the methods for the Fetcher
@@ -28,17 +29,16 @@ type FetcherInterface interface {
 func NewFetcher(ingestor *Ingestor) *Fetcher {
 	return &Fetcher{
 		ingestor: ingestor,
-		pool: NewWorkerPool("Fetcher", runtime.NumCPU(), ingestor.fetchQueue, func(ctx context.Context, id int, job interface{}) error {
-			batch := job.([]string)
-			log.Printf("Fetcher %d fetching batch of %d symbols", id, len(batch))
+		pool: NewWorkerPool[FetchTask]("Fetcher", runtime.NumCPU(), ingestor.fetchQueue, func(ctx context.Context, id int, job FetchTask) error {
+			log.Printf("Fetcher %d fetching batch of %d symbols from %s to %s", id, len(job.Symbols), job.Start, job.End)
 			if err := ingestor.rateLimiter.Wait(ctx); err != nil {
 				log.Printf("Fetcher %d stopped due to context cancellation: %v", id, err)
 				return err
 			}
 
-			dataMap, err := fetchBatch(&http.Client{}, batch, ingestor)
+			dataMap, err := fetchBatch(&http.Client{}, job.Symbols, job.Start, job.End, ingestor)
 			if err != nil {
-				for _, symbol := range batch {
+				for _, symbol := range job.Symbols {
 					select {
 					case ingestor.failureQueue <- Failure{Type: "fetch", Symbol: symbol, Error: err}:
 					case <-ctx.Done():
@@ -68,19 +68,24 @@ func (f *Fetcher) Start(ctx context.Context, wg *sync.WaitGroup) {
 	f.pool.Start(ctx, wg)
 }
 
-func fetchBatch(client *http.Client, symbols []string, ingestor *Ingestor) (map[string][]Bar, error) {
+func fetchBatch(client *http.Client, symbols []string, start, end string, ingestor *Ingestor) (map[string][]Bar, error) {
 	symbolStr := strings.Join(symbols, ",")
+	params := url.Values{
+		"symbols":    []string{symbolStr},
+		"timeframe":  []string{"1Day"},
+		"start":      []string{start},
+		"end":        []string{end},
+		"limit":      []string{"10000"},
+		"adjustment": []string{"all"},
+	}
+	//TODO: Put this in the ingestor.cfg
+	if os.Getenv("IS_FREE") == "true" {
+		params["feed"] = []string{"iex"}
+	}
 	resp, err := DoRequest(RequestOptions{
 		Method: "GET",
 		URL:    dataURL + "stocks/bars",
-		Params: url.Values{
-			"symbols":    []string{symbolStr},
-			"timeframe":  []string{"1Day"},
-			"start":      []string{"2023-01-01"},
-			"end":        []string{"2023-12-31"},
-			"limit":      []string{"10000"},
-			"adjustment": []string{"all"},
-		},
+		Params: params,
 		Headers: map[string]string{
 			"APCA-API-KEY-ID":     ingestor.Cfg.AlpacaKey,
 			"APCA-API-SECRET-KEY": ingestor.Cfg.AlpacaSecret,
