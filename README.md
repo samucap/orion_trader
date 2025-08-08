@@ -12,7 +12,6 @@ This service fetches historical price data, market volatility metrics (VIX proxy
 - **Rich Feature Set:**
   - **Technical Indicators:** Calculates SMA, EMA, RSI, MACD, and Bollinger Bands from raw price data.
   - **Market Volatility:** Fetches VIXY ETF data as a proxy for VIX index to provide market-wide volatility context.
-  - **News Sentiment Analysis:** Ingests news articles and calculates a daily average sentiment score for each ticker using a simple keyword-based analyzer.
 - **Rate Limiting:** Respects Alpaca's 200 requests/minute limit using a token-based limiter.
 - **Object Storage:** Uses a local MinIO server to simulate a cloud object storage environment (like AWS S3), a best practice for decoupled ML systems.
 - **Built-in Monitoring:**
@@ -57,15 +56,23 @@ git clone <your-repo-url>
 cd <your-repo-directory>
 ```
 
+- For testing now you need to 'export GOEXPERIMENT=synctest'
+
 ## TODO
 
 X - Go back 5 years and rolling fetches and calculations
 
-- need to verify continuous data fetch
-- For testing now you need to 'export GOEXPERIMENT=synctest'
 - Need to merge all the data fetching.
 - fix the DoRequest func signature, need to abstract some stuff so it's not so disorganized
+- after http requests are abstracted, abstract alpaca markets specific stuff. If possible
+  make a Providers abstraction
+- Swap to polygon
+
+- need to verify continuous data fetch
+
 - finish testing the concurrency pipelines
 - NEED TO VERIFY indicators calculations
-- more robust benchmarking
-- change MinIO writes to be batched
+- benchmarking and review pprof
+- review cause for processing failures
+- change MinIO writes to be batched?
+- **News Sentiment Analysis:** Ingests news articles and calculates a daily average sentiment score for each ticker using a simple keyword-based analyzer.

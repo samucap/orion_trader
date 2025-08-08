@@ -2,19 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"net/url"
-)
 
-import (
 	"github.com/joho/godotenv"
 	"golang.org/x/time/rate"
 )
@@ -64,14 +59,14 @@ func NewIngestor() (*Ingestor, error) {
 	}
 
 	return &Ingestor{
-		Cfg:              cfg,
-		MinIO:            minioClient,
-		fetchQueue:       make(chan FetchTask, 100),
-		processQueue:     make(chan FetchedData, 1000),
-		uploadQueue:      make(chan UploadJob, 1000),
-		failureQueue:     make(chan Failure, 1000),
-		rateLimiter:      rate.NewLimiter(rate.Every(300*time.Millisecond), 1),
-		startTime:        time.Now(),
+		Cfg:          cfg,
+		MinIO:        minioClient,
+		fetchQueue:   make(chan FetchTask, 100),
+		processQueue: make(chan FetchedData, 1000),
+		uploadQueue:  make(chan UploadJob, 1000),
+		failureQueue: make(chan Failure, 1000),
+		rateLimiter:  rate.NewLimiter(rate.Every(300*time.Millisecond), 1),
+		startTime:    time.Now(),
 	}, nil
 }
 
@@ -92,17 +87,16 @@ func (i *Ingestor) Run(ctx context.Context) error {
 	uploader.Start(ctx, &wg)
 
 	// Initial historical fetch
-	if err := i.fetchAssetsAndQueueHistorical(ctx); err != nil {
-		return fmt.Errorf("failed to fetch assets and queue historical: %w", err)
+	if err := fetcher.FetchAssets(ctx); err != nil {
+		return fmt.Errorf("failed to fetch assets: %w", err)
 	}
-
 	// Daily update loop
 	for {
 		dur := timeToNextFetch()
 		log.Printf("Sleeping %v until next fetch", dur)
 		select {
 		case <-time.After(dur):
-			if err := i.queueDailyJobs(ctx); err != nil {
+			if err := fetcher.QueueDailyJobs(ctx); err != nil {
 				log.Printf("Daily queue failed: %v", err)
 			}
 		case <-ctx.Done():
@@ -119,137 +113,6 @@ func (i *Ingestor) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-}
-
-func (i *Ingestor) fetchAssetsAndQueueHistorical(ctx context.Context) error {
-	log.Printf("Fetching assets from Alpaca API")
-	resp, err := DoRequest(RequestOptions{
-		Method: "GET",
-		URL:    tradingURL + "assets",
-		Params: url.Values{
-			"status":      []string{"active"},
-			"asset_class": []string{"us_equity"},
-		},
-		Headers: map[string]string{
-			"APCA-API-KEY-ID":     i.Cfg.AlpacaKey,
-			"APCA-API-SECRET-KEY": i.Cfg.AlpacaSecret,
-		},
-		Retry: false,
-	})
-	if err != nil {
-		log.Printf("Failed to fetch assets: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-	log.Printf("Received assets response: %s", resp.Status)
-
-	var assets []Asset
-	if err := json.NewDecoder(resp.Body).Decode(&assets); err != nil {
-		return fmt.Errorf("failed to decode assets: %w", err)
-	}
-
-	var symbols []string
-	for _, a := range assets {
-		if a.Tradable {
-			symbols = append(symbols, a.Symbol)
-		}
-	}
-	i.symbols = symbols
-	i.totalSymbols.Store(int64(len(symbols)))
-	log.Printf("Found %d tradable symbols: %s", len(symbols), strings.Join(symbols[:min(5, len(symbols))], ", ")+minStr(5, len(symbols)))
-
-	now := time.Now()
-	start := now.AddDate(-5, 0, 0).Format("2006-01-02")
-	end := now.Format("2006-01-02")
-
-	if err := i.fetchVixData(start, end); err != nil {
-		log.Printf("WARN: Failed to fetch historical VIXY: %v", err)
-	}
-
-	i.queueJobs(ctx, start, end)
-	return nil
-}
-
-func (i *Ingestor) queueDailyJobs(ctx context.Context) error {
-	now := time.Now()
-	start := now.AddDate(0, 0, -1).Format("2006-01-02")
-	end := now.Format("2006-01-02")
-
-	if err := i.fetchVixData(start, end); err != nil {
-		log.Printf("WARN: Failed to fetch daily VIXY: %v", err)
-	}
-
-	i.queueJobs(ctx, start, end)
-	return nil
-}
-
-func (i *Ingestor) queueJobs(ctx context.Context, start, end string) {
-	const batchSize = 200
-	for j := 0; j < len(i.symbols); j += batchSize {
-		endIdx := min(j+batchSize, len(i.symbols))
-		batch := i.symbols[j:endIdx]
-		select {
-		case i.fetchQueue <- FetchTask{Symbols: batch, Start: start, End: end}:
-		case <-ctx.Done():
-			log.Printf("Stopped queuing batches due to context cancellation")
-			return
-		}
-	}
-	log.Printf("Queued %d batches for fetching from %s to %s", (len(i.symbols)+batchSize-1)/batchSize, start, end)
-}
-
-func (i *Ingestor) fetchVixData(start, end string) error {
-	log.Printf("Fetching VIXY data from %s to %s", start, end)
-	params := url.Values{
-		"symbols":    []string{"VIXY"},
-		"timeframe":  []string{"1Day"},
-		"start":      []string{start},
-		"end":        []string{end},
-		"limit":      []string{"10000"},
-		"adjustment": []string{"all"},
-	}
-
-	//TODO: Put this in the ingestor.cfg
-	if os.Getenv("IS_FREE") == "true" {
-		params["feed"] = []string{"iex"}
-	}
-	resp, err := DoRequest(RequestOptions{
-		Method: "GET",
-		URL:    dataURL + "stocks/bars",
-		Params: params,
-		Headers: map[string]string{
-			"APCA-API-KEY-ID":     i.Cfg.AlpacaKey,
-			"APCA-API-SECRET-KEY": i.Cfg.AlpacaSecret,
-		},
-		Retry: false,
-	})
-	if err != nil {
-		log.Printf("Failed to fetch VIXY data: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-	log.Printf("Received VIXY response: %s", resp.Status)
-
-	var result struct {
-		Bars map[string][]struct {
-			T string  `json:"t"`
-			C float64 `json:"c"`
-		} `json:"bars"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("failed to decode VIXY data: %w", err)
-	}
-
-	for _, b := range result.Bars["VIXY"] {
-		ts, err := time.Parse(time.RFC3339, b.T)
-		if err != nil {
-			log.Printf("Skipping invalid VIXY timestamp %s: %v", b.T, err)
-			continue
-		}
-		vixMap[ts.Format("2006-01-02")] = b.C
-	}
-	log.Printf("Fetched %d VIXY data points", len(result.Bars["VIXY"]))
-	return nil
 }
 
 func (i *Ingestor) handleFailures(ctx context.Context) {
@@ -293,6 +156,7 @@ func (i *Ingestor) startMonitoring(ctx context.Context) {
 	}
 }
 
+// TODO put into util
 func min(a, b int) int {
 	if a < b {
 		return a

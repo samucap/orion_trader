@@ -42,6 +42,8 @@ func NewProcessor(ingestor *Ingestor) *Processor {
 		ingestor: ingestor,
 		pool: NewWorkerPool[FetchedData]("Processor", runtime.NumCPU(), ingestor.processQueue, func(ctx context.Context, id int, job FetchedData) error {
 			log.Printf("Processor %d received data for %s with %d bars", id, job.Symbol, len(job.PriceData))
+			// TODO why in the f word is this getting instantiated? Inside itself?
+			// TODO need to decode response.Body and close it too
 			p := Processor{ingestor: ingestor}
 			if err := p.ProcessAndSave(ctx, job); err != nil {
 				select {
