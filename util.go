@@ -28,21 +28,21 @@ type AppConfig struct {
 
 // Asset represents an Alpaca asset
 type Asset struct {
-	AlpacaID                    string   `json:"id" validate:"required"`
-	Class                       string   `json:"class" validate:"required,oneof=us_equity us_option crypto"`
-	Cusip                       *string  `json:"cusip"`
-	Exchange                    string   `json:"exchange" validate:"required,oneof=AMEX ARCA BATS NYSE NASDAQ NYSEARCA OTC"`
-	Symbol                      string   `json:"symbol" validate:"required"`
-	Name                        string   `json:"name" validate:"required,min=1"`
-	Status                      string   `json:"status" validate:"required,oneof=active inactive"`
-	Tradable                    bool     `json:"tradable" validate:"required"`
-	Marginable                  bool     `json:"marginable" validate:"required"`
-	Shortable                   bool     `json:"shortable" validate:"required"`
-	EasyToBorrow                bool     `json:"easy_to_borrow" validate:"required"`
-	Fractionable                bool     `json:"fractionable" validate:"required"`
-	MarginRequirementLong       string   `json:"margin_requirement_long"`
-	MarginRequirementShort      string   `json:"margin_requirement_short"`
-	Attributes                  []string `json:"attributes" validate:"dive,oneof=ptp_no_exception ptp_with_exception ipo has_options options_late_close"`
+	AlpacaID               string   `json:"id" validate:"required"`
+	Class                  string   `json:"class" validate:"required,oneof=us_equity us_option crypto"`
+	Cusip                  *string  `json:"cusip"`
+	Exchange               string   `json:"exchange" validate:"required,oneof=AMEX ARCA BATS NYSE NASDAQ NYSEARCA OTC"`
+	Symbol                 string   `json:"symbol" validate:"required"`
+	Name                   string   `json:"name" validate:"required,min=1"`
+	Status                 string   `json:"status" validate:"required,oneof=active inactive"`
+	Tradable               bool     `json:"tradable" validate:"required"`
+	Marginable             bool     `json:"marginable" validate:"required"`
+	Shortable              bool     `json:"shortable" validate:"required"`
+	EasyToBorrow           bool     `json:"easy_to_borrow" validate:"required"`
+	Fractionable           bool     `json:"fractionable" validate:"required"`
+	MarginRequirementLong  string   `json:"margin_requirement_long"`
+	MarginRequirementShort string   `json:"margin_requirement_short"`
+	Attributes             []string `json:"attributes" validate:"dive,oneof=ptp_no_exception ptp_with_exception ipo has_options options_late_close"`
 }
 
 // Bar represents a single price bar
@@ -96,6 +96,18 @@ var (
 	vixMap     = make(map[string]float64) // date -> VIXY close
 	tradingURL = "https://paper-api.alpaca.markets/v2/"
 	dataURL    = "https://data.alpaca.markets/v2/"
+	// TODO maybe it's not good to have this global? var
+	// maybe make this a struct with a constructor func that initializes the http client
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,              // Max idle connections across all hosts
+			MaxIdleConnsPerHost: 10,               // Max idle connections per host
+			IdleConnTimeout:     90 * time.Second, // Keep connections alive for 90s
+			TLSHandshakeTimeout: 10 * time.Second, // Timeout for TLS handshake
+			MaxConnsPerHost:     50,               // Max total connections per host
+		},
+		Timeout: 30 * time.Second, // Overall request timeout
+	}
 )
 
 // minioAdapter wraps minio.Client to adapt GetObject return type
@@ -151,8 +163,7 @@ func DoRequest(opts RequestOptions) (*http.Response, error) {
 		}
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		if opts.Retry {
 			return nil, fmt.Errorf("network error: %w", err)
