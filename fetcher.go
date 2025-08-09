@@ -114,7 +114,6 @@ func (f *Fetcher) FetchAssets(ctx context.Context) error {
 	f.ingestor.symbols = symbols
 	f.ingestor.totalSymbols.Store(int64(len(symbols)))
 	log.Printf("Found %d tradable symbols: %s", len(f.ingestor.symbols), strings.Join(f.ingestor.symbols[:min(5, len(f.ingestor.symbols))], ", ")+minStr(5, len(f.ingestor.symbols)))
-	//fmt.Printf("symbols==================================== %v\n", f.ingestor.symbols[:20])
 
 	now := time.Now()
 	start := now.AddDate(-10, 0, 0).Format("2006-01-02")

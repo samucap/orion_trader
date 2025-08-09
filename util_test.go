@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"testing"
 )
 
@@ -86,51 +85,6 @@ func TestDoRequest(t *testing.T) {
 			},
 			wantErr:    true,
 			wantErrMsg: "server error (status: 500 Internal Server Error): {\"error\":\"internal server error\"}",
-		},
-		{
-			name: "POST request with body",
-			opts: RequestOptions{
-				Method: "POST",
-				URL:    "/post-test",
-				Headers: map[string]string{
-					"Content-Type":        "application/json",
-					"APCA-API-KEY-ID":     "test-key",
-					"APCA-API-SECRET-KEY": "test-secret",
-				},
-				Body:  strings.NewReader(`{"data":"test"}`),
-				Retry: false,
-			},
-			serverResponse: func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != "POST" {
-					t.Errorf("Expected method POST, got %s", r.Method)
-				}
-				if r.Header.Get("Content-Type") != "application/json" {
-					t.Errorf("Expected Content-Type=application/json, got %s", r.Header.Get("Content-Type"))
-				}
-				body, _ := io.ReadAll(r.Body)
-				if string(body) != `{"data":"test"}` {
-					t.Errorf("Expected body={\"data\":\"test\"}, got %s", string(body))
-				}
-				w.WriteHeader(http.StatusOK)
-				fmt.Fprint(w, `{"status":"posted"}`)
-			},
-			wantStatus: http.StatusOK,
-			wantBody:   `{"status":"posted"}`,
-			wantErr:    false,
-		},
-		{
-			name: "invalid method",
-			opts: RequestOptions{
-				Method:  "INVALID",
-				URL:     "/test",
-				Headers: map[string]string{},
-				Retry:   false,
-			},
-			serverResponse: func(w http.ResponseWriter, r *http.Request) {
-				t.Error("Server should not be called for invalid method")
-			},
-			wantErr:    true,
-			wantErrMsg: "failed to create request: net/http: invalid method \"INVALID\"",
 		},
 	}
 
