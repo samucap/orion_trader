@@ -1,3 +1,6 @@
 .env
 .DS_Store
 data
+trader
+flatfiles
+us-stock-day-aggs-v1
