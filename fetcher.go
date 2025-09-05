@@ -125,33 +125,16 @@ func (f *Fetcher) Start(ctx context.Context, wg *sync.WaitGroup) {
 	f.pool.Start(ctx, wg)
 }
 
-//dataProvider: map[string]string{
-//			"apiURL":            os.Getenv("POLY_API_URL"),
-//			"apiKey":            os.Getenv("POLY_API_KEY"),
-//			"flatFilesURL":      os.Getenv("POLY_FLATFILES_S3URL"),
-//			"flatFilesKeyID":    os.Getenv("POLY_FLATFILES_KEY_ID"),
-//			"flatFilesSecret":   os.Getenv("POLY_FLATFILES_SECRET_KEY"),
-//			"flatFilesS3Bucket": os.Getenv("POLY_FLATFILES_S3BUCKET"),
-//		}
-func (f *Fetcher) FetchHistorical(ctx context.Context) error {
-	opts := RequestOptions{
-		Method: "GET",
-		URL: f.dataProvider.flatFilesS3Bucket + "/v3/reference/tickers",
-		Params: url.Values{
-			active: []string{"true"},
-			limit: []string{"1000"},
-			sort: []string{"ticker"},
-			apiKey: []string{f.AppConfig.dataProvider.apiURL}
-		}
-	}
-
-	if resp, err := f.DoRequest(opts); err != nil {
-		defer resp.
-		f.ingestor.processQueue
-	} else {
-		return err
-	}
-}
+//	dataProvider: map[string]string{
+//				"apiURL":            os.Getenv("POLY_API_URL"),
+//				"apiKey":            os.Getenv("POLY_API_KEY"),
+//				"flatFilesURL":      os.Getenv("POLY_FLATFILES_S3URL"),
+//				"flatFilesKeyID":    os.Getenv("POLY_FLATFILES_KEY_ID"),
+//				"flatFilesSecret":   os.Getenv("POLY_FLATFILES_SECRET_KEY"),
+//				"flatFilesS3Bucket": os.Getenv("POLY_FLATFILES_S3BUCKET"),
+//			}
+//func (f *Fetcher) FetchHistorical(ctx context.Context) error {
+//}
 
 func (f *Fetcher) FetchAssets(ctx context.Context) error {
 	log.Printf("Fetching assets from Alpaca API")
@@ -353,9 +336,9 @@ func (f *Fetcher) QueueDailyJobs(ctx context.Context) error {
 	start := now.AddDate(0, 0, -1).Format("2006-01-02")
 	end := now.Format("2006-01-02")
 
-	if err := f.fetchVixData(start, end); err != nil {
-		log.Printf("WARN: Failed to fetch daily VIXY: %v", err)
-	}
+	//if err := f.fetchVixData(start, end); err != nil {
+	//	log.Printf("WARN: Failed to fetch daily VIXY: %v", err)
+	//}
 
 	f.queueJobs(ctx, start, end)
 	return nil
@@ -401,7 +384,6 @@ func (f *Fetcher) DoRequest(opts RequestOptions) (*http.Response, error) {
 		return nil, err
 	}
 
-	// TODO need to remove this part
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()

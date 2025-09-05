@@ -7,8 +7,8 @@ endDate=$(date +%F)
 IFS='-' read -r startYear startMonth startDay <<<"${startDate}"
 IFS='-' read -r endYear endMonth endDay <<<"${endDate}"
 
-# TODO: need to get acessKey
-rclone config create s3polygon s3 env_auth=false access_key_id=$(get) secret_access_key=$(get) endpoint=https://files.polygon.io
+# TODO: NEED TO REMOVE THESE KEYS
+rclone config create s3polygon s3 env_auth=false access_key_id=asdf secret_access_key=asdf endpoint=https://files.polygon.io
 
 currYear=$startYear
 while [ "$currYear" -le "$endYear" ]; do

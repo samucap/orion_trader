@@ -1,0 +1,42 @@
+services:
+  # MinIO service to act as our local S3-compatible object storage
+  minio:
+    hostname: minio
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      # Expose API port 9000 and Console port 9001
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    # Use environment variables to set root user and password for MinIO
+    env_file:
+      - .env
+    # The command to start the MinIO server and create the console
+    command: server /data --console-address ":9001"
+    networks:
+      - orion_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  app:
+    build:
+      dockerfile: Dockerfile-python
+    container_name: python-cleaner
+    # Mount the local directory to see code changes without rebuilding the image
+    env_file:
+      - .env
+    networks:
+      - orion_net
+    depends_on:
+      - minio
+networks:
+  orion_net:
+    driver: bridge
+
+volumes:
+  minio_data:
