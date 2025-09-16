@@ -1,5 +1,4 @@
 services:
-  # MinIO service to act as our local S3-compatible object storage
   minio:
     hostname: minio
     image: minio/minio:latest
@@ -9,7 +8,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - minio_data:/data
+      - minio_vol:/data
     # Use environment variables to set root user and password for MinIO
     env_file:
       - .env
@@ -22,21 +21,21 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
-
-  app:
+  python_cleaner:
     build:
-      dockerfile: Dockerfile-python
-    container_name: python-cleaner
+      context: .
+      dockerfile: Dockerfile_python
     # Mount the local directory to see code changes without rebuilding the image
     env_file:
       - .env
     networks:
       - orion_net
-    depends_on:
-      - minio
+    volumes:
+      - ./flatfiles:/app/flatfiles:ro
 networks:
   orion_net:
     driver: bridge
-
 volumes:
-  minio_data:
+  minio_vol:
+# MinIO service to act as our local S3-compatible object storage
+
