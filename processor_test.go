@@ -47,7 +47,7 @@ func TestProcessAndSave(t *testing.T) {
 	// Setup
 	ingestor := &Ingestor{
 		Cfg: &AppConfig{
-			FeaturesBucketName: "features-market-data",
+			FeaturesBucketName: "features-market-data-test",
 		},
 		uploadQueue:      make(chan UploadJob, 10),
 		failureQueue:     make(chan Failure, 10),
@@ -155,7 +155,7 @@ func TestProcessorConcurrency(t *testing.T) {
 	processor.Start(ctx, &wg)
 	for i := 0; i < 10; i++ {
 		data := FetchedData{
-			Symbol: fmt.Sprintf("TEST%d", i),
+			Symbol:    fmt.Sprintf("TEST%d", i),
 			PriceData: make([]Bar, 100),
 		}
 		for j := 0; j < 100; j++ {

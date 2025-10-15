@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -22,27 +21,6 @@ type AppConfig struct {
 	MinIOSecretKey     string
 	MinIOUseSSL        bool
 	FeaturesBucketName string
-	AlpacaKey          string
-	AlpacaSecret       string
-}
-
-// Asset represents an Alpaca asset
-type Asset struct {
-	AlpacaID               string   `json:"id" validate:"required"`
-	Class                  string   `json:"class" validate:"required,oneof=us_equity us_option crypto"`
-	Cusip                  *string  `json:"cusip"`
-	Exchange               string   `json:"exchange" validate:"required,oneof=AMEX ARCA BATS NYSE NASDAQ NYSEARCA OTC"`
-	Symbol                 string   `json:"symbol" validate:"required"`
-	Name                   string   `json:"name" validate:"required,min=1"`
-	Status                 string   `json:"status" validate:"required,oneof=active inactive"`
-	Tradable               bool     `json:"tradable" validate:"required"`
-	Marginable             bool     `json:"marginable" validate:"required"`
-	Shortable              bool     `json:"shortable" validate:"required"`
-	EasyToBorrow           bool     `json:"easy_to_borrow" validate:"required"`
-	Fractionable           bool     `json:"fractionable" validate:"required"`
-	MarginRequirementLong  string   `json:"margin_requirement_long"`
-	MarginRequirementShort string   `json:"margin_requirement_short"`
-	Attributes             []string `json:"attributes" validate:"dive,oneof=ptp_no_exception ptp_with_exception ipo has_options options_late_close"`
 }
 
 // Bar represents a single price bar
@@ -57,8 +35,7 @@ type Bar struct {
 
 // FetchedData holds price data for a symbol
 type FetchedData struct {
-	Symbol    string
-	PriceData []Bar
+	Response http.Response
 }
 
 // Failure represents a fetch or process failure
@@ -81,33 +58,9 @@ type FetchTask struct {
 	End     string
 }
 
-// RequestOptions defines parameters for an HTTP request
-type RequestOptions struct {
-	Method  string            // HTTP method (e.g., GET, POST)
-	URL     string            // Request URL
-	Params  url.Values        // Query parameters
-	Headers map[string]string // HTTP headers
-	Body    io.Reader         // Request body
-	Retry   bool              // Retry on network errors or 5xx
-}
-
 var (
-	validate   = validator.New(validator.WithRequiredStructEnabled())
-	vixMap     = make(map[string]float64) // date -> VIXY close
-	tradingURL = "https://paper-api.alpaca.markets/v2/"
-	dataURL    = "https://data.alpaca.markets/v2/"
-	// TODO maybe it's not good to have this global? var
-	// maybe make this a struct with a constructor func that initializes the http client
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        100,              // Max idle connections across all hosts
-			MaxIdleConnsPerHost: 10,               // Max idle connections per host
-			IdleConnTimeout:     90 * time.Second, // Keep connections alive for 90s
-			TLSHandshakeTimeout: 10 * time.Second, // Timeout for TLS handshake
-			MaxConnsPerHost:     50,               // Max total connections per host
-		},
-		Timeout: 30 * time.Second, // Overall request timeout
-	}
+	validate = validator.New(validator.WithRequiredStructEnabled())
+	vixMap   = make(map[string]float64) // date -> VIXY close
 )
 
 // minioAdapter wraps minio.Client to adapt GetObject return type
@@ -143,44 +96,6 @@ func NewMinIOClient(cfg *AppConfig) (MinIOClient, error) {
 	}
 
 	return &minioAdapter{client}, nil
-}
-
-// DoRequest performs a customizable HTTP request
-func DoRequest(opts RequestOptions) (*http.Response, error) {
-	u := opts.URL
-	if opts.Params != nil && len(opts.Params) > 0 {
-		u += "?" + opts.Params.Encode()
-	}
-
-	req, err := http.NewRequest(opts.Method, u, opts.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	if opts.Headers != nil {
-		for key, value := range opts.Headers {
-			req.Header.Set(key, value)
-		}
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		if opts.Retry {
-			return nil, fmt.Errorf("network error: %w", err)
-		}
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if opts.Retry && resp.StatusCode >= 500 {
-			return nil, fmt.Errorf("server error (status: %s): %s", resp.Status, string(body))
-		}
-		return nil, fmt.Errorf("request failed (status: %s): %s", resp.Status, string(body))
-	}
-
-	return resp, nil
 }
 
 func startPprofServer() {

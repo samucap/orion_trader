@@ -44,13 +44,14 @@ func NewIngestor() (*Ingestor, error) {
 	}
 
 	cfg := &AppConfig{
-		MinIOEndpoint:      os.Getenv("MINIO_ENDPOINT"),
-		MinIOAccessKey:     os.Getenv("MINIO_ROOT_USER"),
-		MinIOSecretKey:     os.Getenv("MINIO_ROOT_PASSWORD"),
-		MinIOUseSSL:        os.Getenv("MINIO_USE_SSL") == "true",
-		FeaturesBucketName: "features-market-data",
-		AlpacaKey:          os.Getenv("ALPACA_API_KEY"),
-		AlpacaSecret:       os.Getenv("ALPACA_API_SECRET"),
+		MinIOEndpoint:          os.Getenv("MINIO_ENDPOINT"),
+		MinIOAccessKey:         os.Getenv("MINIO_ROOT_USER"),
+		MinIOSecretKey:         os.Getenv("MINIO_ROOT_PASSWORD"),
+		MinIOUseSSL:            os.Getenv("MINIO_USE_SSL") == "true",
+		FaaturesBucketName:     "polygon-data",
+		PolygonFlatFilesURL:    os.GetEnv("POLY_FLATFILES_S3URL"),
+		PolygonFlatFilesBucket: os.GetEnv("POLY_FLATFILES_S3BUCKET"),
+		PolygonKey:             os.GetEnv("POLY_API_KEY"),
 	}
 
 	minioClient, err := NewMinIOClient(cfg)
@@ -74,6 +75,7 @@ func NewIngestor() (*Ingestor, error) {
 func (i *Ingestor) Run(ctx context.Context) error {
 	log.Printf("Starting pipeline")
 	go i.startMonitoring(ctx)
+	// TODO if dev env
 	go startPprofServer()
 	go i.handleFailures(ctx)
 
@@ -86,7 +88,6 @@ func (i *Ingestor) Run(ctx context.Context) error {
 	processor.Start(ctx, &wg)
 	uploader.Start(ctx, &wg)
 
-	// Initial historical fetch
 	if err := fetcher.FetchAssets(ctx); err != nil {
 		return fmt.Errorf("failed to fetch assets: %w", err)
 	}
