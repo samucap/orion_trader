@@ -6,7 +6,7 @@ This document describes the testing framework for `cleaner.py` that validates da
 
 ## Key Accomplishments
 
-### ✅ **Real Data Testing**
+### **Real Data Testing**
 
 Created `test_cleaner.py` with actual data validation:
 
@@ -20,7 +20,7 @@ Created `test_cleaner.py` with actual data validation:
 
 ## Test Coverage Areas
 
-### 🔍 **Row Count Integrity**
+### **Row Count Integrity**
 
 - **CSV Input**: Verifies all rows from CSV files are read correctly
 - **Ticker Processing**: Ensures proper grouping and processing of tickers
@@ -34,7 +34,7 @@ Created `test_cleaner.py` with actual data validation:
 3. Year results count ≤ tickers processed (some may be skipped due to errors)
 4. Final DataFrame rows consistent with year results (within tolerance)
 
-### 🛡️ **Error Handling & Data Quality**
+### **Error Handling & Data Quality**
 
 - Data quality assessment of real CSV files
 - Missing value detection and reporting
@@ -64,7 +64,7 @@ make pytest TEST=test_2020_full_processing_row_count_integrity
 
 ## Key Test Results
 
-### ✅ **Real Data Validation**
+### **Real Data Validation**
 
 - Successfully processes 43/86 files for 2020 (382,896 rows) for faster testing
 - Full processing of all 86 files produces 777,999 rows
@@ -72,7 +72,7 @@ make pytest TEST=test_2020_full_processing_row_count_integrity
 - Data sorted by date then ticker for consistent ordering
 - Technical indicators use forward fill only (industry standard)
 
-### ✅ **Data Quality Assessment**
+### **Data Quality Assessment**
 
 - Missing value detection and reporting across all columns
 - Data range validation (volume, prices, transactions)
@@ -121,21 +121,21 @@ test_cleaner.py
 
 ## Validation Results
 
-### **Row Count Integrity: ✅ PASSED**
+### **Row Count Integrity: PASSED**
 
 - CSV rows properly tracked from input to output with 2% tolerance
 - Data sorted by date then ticker for consistent ordering
 - Validation rules correctly identify anomalies
 - Error handling preserves data integrity
 
-### **Data Quality: ✅ PASSED**
+### **Data Quality: PASSED**
 
 - Missing value detection and reporting across all columns
 - Technical indicators use industry-standard forward fill only
 - Data range validation for financial metrics
 - Graceful handling of edge cases and corrupted data
 
-### **Test Reliability: ✅ PASSED**
+### **Test Reliability: PASSED**
 
 - Tests run consistently with real data from ./flatfiles
 - Half-file processing enables faster test execution
