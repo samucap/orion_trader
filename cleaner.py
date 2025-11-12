@@ -8,6 +8,31 @@ from dotenv import load_dotenv
 import talib.abstract as ta
 load_dotenv()
 
+# ANSI color codes for colored printing
+class Colors:
+    GREEN = '\033[92m'  # Success/OK
+    YELLOW = '\033[93m'  # Warning
+    RED = '\033[91m'  # Error
+    BLUE = '\033[94m'  # Info
+    CYAN = '\033[96m'  # Info
+    RESET = '\033[0m'  # Reset to default
+
+def print_success(message):
+    """Print success message in green"""
+    print(f"{Colors.GREEN}{message}{Colors.RESET}")
+
+def print_warning(message):
+    """Print warning message in yellow"""
+    print(f"{Colors.YELLOW}{message}{Colors.RESET}")
+
+def print_error(message):
+    """Print error message in red"""
+    print(f"{Colors.RED}{message}{Colors.RESET}")
+
+def print_info(message):
+    """Print info message in blue"""
+    print(f"{Colors.BLUE}{message}{Colors.RESET}")
+
 def process_year_files(year, minio=None, lastclose=None, lasthi=None, lastlo=None):
     """Process all files for a given year and return row count statistics"""
     files = sorted(glob.glob(f'./flatfiles/{year}/*/*'))
@@ -69,22 +94,22 @@ def process_year_files(year, minio=None, lastclose=None, lasthi=None, lastlo=Non
         year_df = year_df.sort_values(['date', 'ticker']).reset_index(drop=True)
         stats['final_df_rows'] = len(year_df)
         write_to_minio(year_df, year, minio)
-        print(f"✅ Written {year}.parquet with {len(year_df)} rows")
+        print_success(f"Written {year}.parquet with {len(year_df)} rows")
     else:
-        print(f"⚠️  No data to write for year {year}")
+        print_warning(f"No data to write for year {year}")
 
     # Validate row counts
     validation_errors = validate_row_counts(stats)
     if validation_errors:
-        print(f"⚠️  Validation errors for year {year}:")
+        print_warning(f"Validation errors for year {year}:")
         for error in validation_errors:
             print(f"  - {error}")
     else:
-        print(f"✅ Row count validation passed for year {year}")
+        print_success(f"Row count validation passed for year {year}")
 
     return stats
 
-def runner(minio=None):
+def runner(minio=None, process_all_years=False):
     lastclose = {}
     lasthi = {}
     lastlo = {}
@@ -93,7 +118,8 @@ def runner(minio=None):
         stats = process_year_files(year, minio, lastclose, lasthi, lastlo)
         print(f"Year {year} stats: {stats}")
 
-        break
+        if not process_all_years:
+            break
     # reading
     resp = minio.get_object('us-stock-day-aggs-v1', "2020.parquet")
     data = io.BytesIO(resp.read())
@@ -112,6 +138,39 @@ def runner(minio=None):
     #print('checking >>>>>>>>>>>>> ', newDF.info())
     #print(newDF.head())
     #print(newDF.tail())
+
+def calculate_indicators_for_series(close, hi, lo):
+    """
+    Calculate technical indicators for given price series.
+    
+    Pure calculation function without cache management - easier to test.
+    
+    Args:
+        close: pandas Series of close prices
+        hi: pandas Series of high prices  
+        lo: pandas Series of low prices
+        
+    Returns:
+        DataFrame with calculated indicators
+    """
+    macd, _, _ = ta.MACD(close)
+    bollub, _, bolllb = ta.BBANDS(close)
+    rsi30 = ta.RSI(close, timeperiod=30)
+    sma30 = ta.SMA(close, timeperiod=30)
+    sma60 = ta.SMA(close, timeperiod=60)
+    cci30 = ta.CCI(hi, lo, close, timeperiod=30)
+    dx30 = ta.DX(hi, lo, close, timeperiod=30)
+    
+    return pd.DataFrame({
+        'macd': macd,
+        'bollub': bollub,
+        'bolllb': bolllb,
+        'rsi30': rsi30,
+        'sma30': sma30,
+        'sma60': sma60,
+        'cci30': cci30,
+        'dx30': dx30
+    })
 
 def add_technical_indicators(tic, df: pd.DataFrame, lastclose, lasthi, lastlo):
     # Sort current year's data chronologically
@@ -141,11 +200,11 @@ def add_technical_indicators(tic, df: pd.DataFrame, lastclose, lasthi, lastlo):
 
     # If length difference is > 10%, there's likely a data issue
     if max_len > min_len * 1.1:  # 10% tolerance
-        print(f"⚠️  Data integrity issue for {tic}: lengths {lengths}")
+        print_warning(f"Data integrity issue for {tic}: lengths {lengths}")
         print(f"Skipping {tic} for this year due to data mismatch")
         return None  # Skip this ticker
 
-    # ✅ BETTER: Ensure all series have same length using proper interpolation
+    # BETTER: Ensure all series have same length using proper interpolation
     target_len = max_len
 
     # Function to safely align series lengths
@@ -173,29 +232,11 @@ def add_technical_indicators(tic, df: pd.DataFrame, lastclose, lasthi, lastlo):
 
     # Verify alignment
     if not (len(close) == len(hi) == len(lo)):
-        print(f"❌ Failed to align series for {tic}")
+        print_error(f"Failed to align series for {tic}")
         return None
 
-    # Calculate indicators on properly aligned data
-    macd, _, _ = ta.MACD(close)
-    bollub, _, bolllb = ta.BBANDS(close)
-    rsi30 = ta.RSI(close, timeperiod=30)
-    sma30 = ta.SMA(close, timeperiod=30)
-    sma60 = ta.SMA(close, timeperiod=60)
-    cci30 = ta.CCI(hi, lo, close, timeperiod=30)
-    dx30 = ta.DX(hi, lo, close, timeperiod=30)
-
-    # Create indicators DataFrame correctly
-    indicators_df = pd.DataFrame({
-        'macd': macd,
-        'bollub': bollub,
-        'bolllb': bolllb,
-        'rsi30': rsi30,
-        'sma30': sma30,
-        'sma60': sma60,
-        'cci30': cci30,
-        'dx30': dx30
-    })
+    # Calculate indicators on properly aligned data using extracted function
+    indicators_df = calculate_indicators_for_series(close, hi, lo)
 
     # Extract current year's portion
     current_year_len = len(df)
@@ -213,6 +254,10 @@ def add_technical_indicators(tic, df: pd.DataFrame, lastclose, lasthi, lastlo):
     current_indicators = current_indicators.ffill()
 
     # Update state with most recent data (ensure consistency)
+    # KV Cache Memory Bounds:
+    # - Cache stores last 60 rows per ticker (matches SMA60, the largest lookback period)
+    # - Estimated memory: ~10,000 tickers × 60 rows × 3 series (close/hi/lo) × 8 bytes ≈ 14.4 MB
+    # - This is a small, bounded cache that prevents memory issues even with many tickers
     state_len = min(60, len(close))
     if state_len >= 30:  # Minimum threshold for reliable indicators
         lastclose[tic] = close.iloc[-state_len:]
@@ -229,7 +274,7 @@ def add_technical_indicators(tic, df: pd.DataFrame, lastclose, lasthi, lastlo):
 def write_to_minio(df, year, minio):
     """Write DataFrame to MinIO as parquet file"""
     if minio is None:
-        print(f"⚠️  MinIO client not provided, skipping upload for {year}.parquet")
+        print_warning(f"MinIO client not provided, skipping upload for {year}.parquet")
         return None
 
     bstream = io.BytesIO()
@@ -245,7 +290,7 @@ def write_to_minio(df, year, minio):
         nbytes,
         content_type="application/octet-stream"
     )
-    print(f"✅ Success: {result.__dict__}")
+    print_success(f"Success: {result.__dict__}")
     bstream.close()
     return result
 
@@ -296,6 +341,8 @@ def makeMinIO():
 
 if __name__ == '__main__':
     minio = makeMinIO()
-    runner(minio)
+    #TODO: review this
+    isdev = True if os.getenv('ENV', 'false') == 'true' else False
+    runner(minio, isdev)
 
 

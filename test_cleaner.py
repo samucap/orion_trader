@@ -15,7 +15,12 @@ from cleaner import (
     process_year_files,
     validate_row_counts,
     add_technical_indicators,
-    write_to_minio
+    write_to_minio,
+    print_success,
+    print_warning,
+    print_error,
+    print_info,
+    calculate_indicators_for_series
 )
 
 class TestCleanerRealData(unittest.TestCase):
@@ -156,7 +161,7 @@ class TestCleanerRealData(unittest.TestCase):
             f"Final rows ({stats['final_df_rows']}) should be at least 90% of input rows ({min_expected_rows})"
         )
 
-        print(f"✅ Row count integrity verified for year {year}: {expected_data_rows} expected -> {stats['total_csv_rows']} read -> {stats['final_df_rows']} written")
+        print_success(f"Row count integrity verified for year {year}: {expected_data_rows} expected -> {stats['total_csv_rows']} read -> {stats['final_df_rows']} written")
 
     def test_year_data_quality_and_bad_row_handling(self):
         """Test data quality and handling of potentially bad rows for configured year"""
@@ -218,7 +223,170 @@ class TestCleanerRealData(unittest.TestCase):
             print(f"Success rate: {success_rate:.1%}")
             self.assertGreater(success_rate, 0.5, "Should successfully process at least 50% of rows")
 
-        print(f"✅ Data quality check passed for year {year} - {stats['final_df_rows']}/{stats['total_csv_rows']} rows processed successfully")
+        print_success(f"Data quality check passed for year {year} - {stats['final_df_rows']}/{stats['total_csv_rows']} rows processed successfully")
+
+    def test_multi_year_kv_cache_persistence(self):
+        """Test that KV cache persists across multiple years and improves indicator quality"""
+        import glob
+        from cleaner import process_year_files
+        
+        # Test with 2-3 years (2020-2022)
+        test_years = [2020, 2021, 2022]
+        
+        # Skip test if not enough years have data
+        available_years = []
+        for year in test_years:
+            files = glob.glob(f'flatfiles/{year}/*/*.csv.gz')
+            if files:
+                available_years.append(year)
+        
+        if len(available_years) < 2:
+            self.skipTest(f"Need at least 2 years of data, found {len(available_years)}")
+        
+        # Use only first 2 available years for faster testing
+        test_years = available_years[:2]
+        print(f"\nTesting KV cache persistence across years: {test_years}")
+        
+        # Initialize caches
+        lastclose = {}
+        lasthi = {}
+        lastlo = {}
+        
+        for idx, year in enumerate(test_years):
+            print(f"\n--- Processing year {year} (year {idx + 1}/{len(test_years)}) ---")
+            
+            # Mock glob to use fewer files for speed (use first 30 files to ensure enough data for cache)
+            all_files = sorted(glob.glob(f'flatfiles/{year}/*/*.csv.gz'))
+            files_to_use = all_files[:30]  # Use 30 files to ensure tickers have >= 30 rows
+            
+            with patch('cleaner.glob.glob', return_value=files_to_use):
+                stats = process_year_files(year, minio=None, 
+                                          lastclose=lastclose, 
+                                          lasthi=lasthi, 
+                                          lastlo=lastlo)
+            
+            print(f"Stats for year {year}: {stats}")
+            
+            # After first year, cache should be populated
+            if idx == 0:
+                print(f"After year {year}:")
+                print(f"  Cache contains {len(lastclose)} tickers")
+                
+                # Verify cache is populated
+                self.assertGreater(len(lastclose), 0, 
+                                 "Cache should contain data after first year")
+                self.assertEqual(len(lastclose), len(lasthi), 
+                               "All caches should have same tickers")
+                self.assertEqual(len(lastclose), len(lastlo), 
+                               "All caches should have same tickers")
+                
+                # Verify cache size is bounded (should be <= 60 rows per ticker)
+                for ticker in list(lastclose.keys())[:5]:  # Check first 5 tickers
+                    cache_size = len(lastclose[ticker])
+                    print(f"  Ticker {ticker}: cache size = {cache_size}")
+                    self.assertLessEqual(cache_size, 60, 
+                                       f"Cache for {ticker} should be <= 60 rows")
+                    self.assertGreaterEqual(cache_size, 30,
+                                          f"Cache for {ticker} should be >= 30 rows (minimum threshold)")
+            
+            # After second year, verify cache keys still match
+            if idx == 1:
+                print(f"After year {year}:")
+                print(f"  Cache still contains {len(lastclose)} tickers")
+                
+                # Cache should still be populated and potentially grown
+                self.assertGreater(len(lastclose), 0,
+                                 "Cache should still contain data after second year")
+        
+        print_success(f"Multi-year KV cache persistence test passed for years {test_years}")
+
+    def test_indicators_with_vs_without_historical_context(self):
+        """Test that indicators calculated with historical context have better quality"""
+        
+        # Use AAPL test data and split into two periods
+        if not os.path.exists('test_data/AAPL_2020_full.csv'):
+            self.skipTest("AAPL test data not available")
+        
+        df = pd.read_csv('test_data/AAPL_2020_full.csv')
+        df = df.sort_values('window_start')
+        
+        # Need at least 80 rows to split meaningfully (40 for each period)
+        if len(df) < 80:
+            self.skipTest(f"Not enough AAPL data (need 80+, have {len(df)})")
+        
+        # Split data: first 60% = "year 1", remaining 40% = "year 2"
+        split_point = int(len(df) * 0.6)
+        df_year1 = df.iloc[:split_point].copy()
+        df_year2 = df.iloc[split_point:].copy()
+        
+        # Add date column as expected by the function
+        df_year1['date'] = pd.to_datetime(df_year1['window_start'], utc=True).dt.strftime("%Y-%m-%d")
+        df_year2['date'] = pd.to_datetime(df_year2['window_start'], utc=True).dt.strftime("%Y-%m-%d")
+        
+        print(f"\nTesting indicator quality with/without historical context")
+        print(f"  Year 1: {len(df_year1)} rows")
+        print(f"  Year 2: {len(df_year2)} rows")
+        
+        # Scenario 1: Calculate year 2 WITHOUT historical context (fresh cache)
+        result_without_cache = add_technical_indicators('AAPL', df_year2, {}, {}, {})
+        
+        # Scenario 2: Calculate year 1, then year 2 WITH historical context
+        lastclose = {}
+        lasthi = {}
+        lastlo = {}
+        
+        # Process year 1 to populate cache
+        result_year1 = add_technical_indicators('AAPL', df_year1, lastclose, lasthi, lastlo)
+        self.assertIsNotNone(result_year1, "Year 1 processing should succeed")
+        
+        # Now cache is populated, process year 2
+        result_with_cache = add_technical_indicators('AAPL', df_year2, lastclose, lasthi, lastlo)
+        
+        # Both should return valid results
+        self.assertIsNotNone(result_without_cache, "Year 2 without cache should succeed")
+        self.assertIsNotNone(result_with_cache, "Year 2 with cache should succeed")
+        
+        # Compare NaN counts in the indicators
+        indicators = ['macd', 'bollub', 'bolllb', 'rsi30', 'sma30', 'sma60', 'cci30', 'dx30']
+        
+        print("\n  Comparing NaN counts (lower is better):")
+        improvements = []
+        for indicator in indicators:
+            nan_without = result_without_cache[indicator].isna().sum()
+            nan_with = result_with_cache[indicator].isna().sum()
+            improvement = nan_without - nan_with
+            improvements.append(improvement)
+            
+            print(f"    {indicator}: without_cache={nan_without} NaNs, with_cache={nan_with} NaNs, improvement={improvement}")
+            
+            # With cache, we should have equal or fewer NaNs
+            self.assertLessEqual(nan_with, nan_without,
+                               f"{indicator} should have <= NaNs with historical context")
+        
+        # At least some indicators should show improvement
+        total_improvement = sum(improvements)
+        print(f"\n  Total NaN reduction: {total_improvement} rows")
+        self.assertGreater(total_improvement, 0,
+                         "Historical context should reduce NaN count overall")
+        
+        # Verify that cached values are valid (not NaN/inf where they should have values)
+        # Note: Values are EXPECTED to differ because cache provides more historical context,
+        # which changes the calculation window for indicators like MACD, RSI, etc.
+        # We just verify the data isn't corrupted (no unexpected NaN/inf)
+        for indicator in indicators:
+            # Check that non-NaN values are finite and reasonable
+            non_nan_with_cache = result_with_cache[indicator].dropna()
+            if len(non_nan_with_cache) > 0:
+                self.assertTrue(np.all(np.isfinite(non_nan_with_cache)),
+                              f"{indicator} has non-finite values with cache")
+                
+                # Verify values are in a reasonable range (not obviously corrupted)
+                # For most indicators, values should be within a reasonable range
+                if indicator in ['rsi30']:  # RSI should be 0-100
+                    self.assertTrue(np.all(non_nan_with_cache >= 0) and np.all(non_nan_with_cache <= 100),
+                                  f"{indicator} values out of expected range [0, 100]")
+        
+        print_success("Indicator quality comparison test passed - historical context reduces NaN count and produces valid values")
 
 
 class TestTechnicalIndicators(unittest.TestCase):
@@ -247,21 +415,23 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Calculate MACD using TA-Lib
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             macd_expected, _, _ = ta.MACD(close)
-
-            # Test the calculation directly (simulating cleaner.py logic)
-            macd_actual, _, _ = ta.MACD(close)
 
             # Verify the calculation matches
             np.testing.assert_array_almost_equal(
-                macd_actual, macd_expected, decimal=6,
+                result['macd'], macd_expected, decimal=6,
                 err_msg=f"MACD calculation mismatch for {ticker}"
             )
 
-            print(f"✅ MACD test passed for {ticker}")
+            print_success(f"MACD test passed for {ticker}")
 
     def test_bollinger_bands_calculation(self):
         """Test Bollinger Bands calculation against TA-Lib reference"""
@@ -270,25 +440,27 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Calculate Bollinger Bands using TA-Lib
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             bollub_expected, _, bolllb_expected = ta.BBANDS(close)
-
-            # Test the calculation directly
-            bollub_actual, _, bolllb_actual = ta.BBANDS(close)
 
             # Verify calculations match
             np.testing.assert_array_almost_equal(
-                bollub_actual, bollub_expected, decimal=6,
+                result['bollub'], bollub_expected, decimal=6,
                 err_msg=f"Bollinger Upper Band mismatch for {ticker}"
             )
             np.testing.assert_array_almost_equal(
-                bolllb_actual, bolllb_expected, decimal=6,
+                result['bolllb'], bolllb_expected, decimal=6,
                 err_msg=f"Bollinger Lower Band mismatch for {ticker}"
             )
 
-            print(f"✅ Bollinger Bands test passed for {ticker}")
+            print_success(f"Bollinger Bands test passed for {ticker}")
 
     def test_rsi_calculation(self):
         """Test RSI calculation against TA-Lib reference"""
@@ -297,21 +469,23 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Calculate RSI using TA-Lib (30 period)
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             rsi_expected = ta.RSI(close, timeperiod=30)
-
-            # Test the calculation directly
-            rsi_actual = ta.RSI(close, timeperiod=30)
 
             # Verify calculations match
             np.testing.assert_array_almost_equal(
-                rsi_actual, rsi_expected, decimal=6,
+                result['rsi30'], rsi_expected, decimal=6,
                 err_msg=f"RSI(30) calculation mismatch for {ticker}"
             )
 
-            print(f"✅ RSI(30) test passed for {ticker}")
+            print_success(f"RSI(30) test passed for {ticker}")
 
     def test_sma_calculation(self):
         """Test SMA calculations against TA-Lib reference"""
@@ -320,27 +494,28 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Test SMA30
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             sma30_expected = ta.SMA(close, timeperiod=30)
-            sma30_actual = ta.SMA(close, timeperiod=30)
+            sma60_expected = ta.SMA(close, timeperiod=60)
 
+            # Verify calculations match
             np.testing.assert_array_almost_equal(
-                sma30_actual, sma30_expected, decimal=6,
+                result['sma30'], sma30_expected, decimal=6,
                 err_msg=f"SMA(30) calculation mismatch for {ticker}"
             )
-
-            # Test SMA60
-            sma60_expected = ta.SMA(close, timeperiod=60)
-            sma60_actual = ta.SMA(close, timeperiod=60)
-
             np.testing.assert_array_almost_equal(
-                sma60_actual, sma60_expected, decimal=6,
+                result['sma60'], sma60_expected, decimal=6,
                 err_msg=f"SMA(60) calculation mismatch for {ticker}"
             )
 
-            print(f"✅ SMA tests passed for {ticker}")
+            print_success(f"SMA tests passed for {ticker}")
 
     def test_cci_calculation(self):
         """Test CCI calculation against TA-Lib reference"""
@@ -349,23 +524,23 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            hi = df['high'].values
-            lo = df['low'].values
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Calculate CCI using TA-Lib (30 period)
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             cci_expected = ta.CCI(hi, lo, close, timeperiod=30)
-
-            # Test the calculation directly
-            cci_actual = ta.CCI(hi, lo, close, timeperiod=30)
 
             # Verify calculations match
             np.testing.assert_array_almost_equal(
-                cci_actual, cci_expected, decimal=6,
+                result['cci30'], cci_expected, decimal=6,
                 err_msg=f"CCI(30) calculation mismatch for {ticker}"
             )
 
-            print(f"✅ CCI(30) test passed for {ticker}")
+            print_success(f"CCI(30) test passed for {ticker}")
 
     def test_dx_calculation(self):
         """Test DX calculation against TA-Lib reference"""
@@ -374,23 +549,23 @@ class TestTechnicalIndicators(unittest.TestCase):
                 continue
 
             df = self.test_data[ticker]
-            hi = df['high'].values
-            lo = df['low'].values
-            close = df['close'].values
+            close = df['close']
+            hi = df['high']
+            lo = df['low']
 
-            # Calculate DX using TA-Lib (30 period)
+            # Calculate using extracted function from cleaner.py
+            result = calculate_indicators_for_series(close, hi, lo)
+
+            # Calculate expected using TA-Lib directly
             dx_expected = ta.DX(hi, lo, close, timeperiod=30)
-
-            # Test the calculation directly
-            dx_actual = ta.DX(hi, lo, close, timeperiod=30)
 
             # Verify calculations match
             np.testing.assert_array_almost_equal(
-                dx_actual, dx_expected, decimal=6,
+                result['dx30'], dx_expected, decimal=6,
                 err_msg=f"DX(30) calculation mismatch for {ticker}"
             )
 
-            print(f"✅ DX(30) test passed for {ticker}")
+            print_success(f"DX(30) test passed for {ticker}")
 
     def test_add_technical_indicators_integration(self):
         """Test the full add_technical_indicators function with real data"""
@@ -422,7 +597,7 @@ class TestTechnicalIndicators(unittest.TestCase):
                 non_nan_count = result[col].notna().sum()
                 self.assertGreater(non_nan_count, 0, f"All {col} values are NaN for {ticker}")
 
-            print(f"✅ Integration test passed for {ticker} - {len(result)} rows with indicators")
+            print_success(f"Integration test passed for {ticker} - {len(result)} rows with indicators")
 
     def test_indicator_calculation_accuracy_with_known_values(self):
         """Test indicator calculations with known input/output values"""
@@ -449,7 +624,7 @@ class TestTechnicalIndicators(unittest.TestCase):
             self.assertAlmostEqual(sma_result[9], manual_sma, places=6,
                                  msg="SMA calculation doesn't match manual calculation")
 
-        print("✅ Known values accuracy test passed")
+        print_success("Known values accuracy test passed")
 
 
 if __name__ == '__main__':

@@ -10,9 +10,9 @@ SHELL := /bin/bash
 # --- Docker Compose Commands ---
 
 # Build and start all services in detached mode
-dev: .env
+dev:
 	@echo "Starting development environment..."
-	docker-compose up --build -d
+	docker-compose up --build -f docker-compose-minio.yml -d
 	#docker-compose up --build -d
 
 # Stop and remove all services, networks, and volumes
