@@ -6,6 +6,14 @@ from minio import Minio
 from minio.error import S3Error
 from dotenv import load_dotenv
 import talib.abstract as ta
+from typing import Optional, Dict, Any
+try:
+    import psycopg2
+    from psycopg2.extras import execute_values
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    print("psycopg2 not available - PostgreSQL support disabled")
 load_dotenv()
 
 # ANSI color codes for colored printing
@@ -33,8 +41,19 @@ def print_info(message):
     """Print info message in blue"""
     print(f"{Colors.BLUE}{message}{Colors.RESET}")
 
-def process_year_files(year, minio=None, lastclose=None, lasthi=None, lastlo=None):
-    """Process all files for a given year and return row count statistics"""
+def process_year_files(year, storage_config=None, minio=None, lastclose=None, lasthi=None, lastlo=None):
+    """
+    Process all files for a given year and return row count statistics.
+    
+    Args:
+        year: Year to process
+        storage_config: Dict with storage backend configuration (optional, for new interface)
+        minio: MinIO client (optional, for backward compatibility)
+        lastclose, lasthi, lastlo: KV cache dictionaries
+        
+    Returns:
+        Dictionary with processing statistics
+    """
     files = sorted(glob.glob(f'./flatfiles/{year}/*/*'))
     print(f'Processing {len(files)} files for year {year}')
 
@@ -93,8 +112,16 @@ def process_year_files(year, minio=None, lastclose=None, lasthi=None, lastlo=Non
         # Sort by date, then ticker for consistent ordering
         year_df = year_df.sort_values(['date', 'ticker']).reset_index(drop=True)
         stats['final_df_rows'] = len(year_df)
-        write_to_minio(year_df, year, minio)
-        print_success(f"Written {year}.parquet with {len(year_df)} rows")
+        
+        # Use new storage routing if config provided, otherwise fall back to legacy MinIO
+        if storage_config:
+            write_results = choose_storage_backend(year, year_df, storage_config, stats)
+            print_info(f"Storage results: {write_results}")
+        elif minio:
+            # Backward compatibility: direct MinIO write
+            write_to_minio(year_df, year, minio)
+        
+        print_success(f"Processed {year}.parquet with {len(year_df)} rows")
     else:
         print_warning(f"No data to write for year {year}")
 
@@ -293,6 +320,142 @@ def write_to_minio(df, year, minio):
     print_success(f"Success: {result.__dict__}")
     bstream.close()
     return result
+
+def write_to_postgres(df: pd.DataFrame, year: int, conn_string: Optional[str] = None, stats: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+    """
+    Write DataFrame to PostgreSQL with bulk insert optimization.
+    
+    Args:
+        df: DataFrame with processed stock data
+        year: Year being processed
+        conn_string: PostgreSQL connection string (defaults to env var)
+        stats: Optional processing statistics to log
+        
+    Returns:
+        Dictionary with write results or None on failure
+    """
+    if not POSTGRES_AVAILABLE:
+        print_warning("psycopg2 not installed - cannot write to PostgreSQL")
+        return None
+        
+    if conn_string is None:
+        conn_string = os.getenv('POSTGRES_CONN')
+        if not conn_string:
+            print_warning("POSTGRES_CONN not set, skipping PostgreSQL write")
+            return None
+    
+    # Prepare data for bulk insert
+    columns = ['ticker', 'date', 'window_start', 'open', 'high', 'low', 
+               'close', 'volume', 'transactions', 'macd', 'bollub', 
+               'bolllb', 'rsi30', 'sma30', 'sma60', 'cci30', 'dx30']
+    
+    # Ensure window_start is timestamp
+    if 'window_start' in df.columns:
+        if pd.api.types.is_integer_dtype(df['window_start']):
+            df = df.copy()
+            df['window_start'] = pd.to_datetime(df['window_start'], unit='ns', utc=True)
+    
+    # Prepare tuples for insert (replace NaN with None for SQL)
+    df_subset = df[columns].copy()
+    df_subset = df_subset.where(pd.notnull(df_subset), None)
+    records = [tuple(row) for row in df_subset.values]
+    
+    try:
+        conn = psycopg2.connect(conn_string)
+        cursor = conn.cursor()
+        
+        # Bulk insert using execute_values (fast)
+        insert_query = f"""
+            INSERT INTO stock_prices ({','.join(columns)})
+            VALUES %s
+            ON CONFLICT (ticker, date) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                transactions = EXCLUDED.transactions,
+                macd = EXCLUDED.macd,
+                bollub = EXCLUDED.bollub,
+                bolllb = EXCLUDED.bolllb,
+                rsi30 = EXCLUDED.rsi30,
+                sma30 = EXCLUDED.sma30,
+                sma60 = EXCLUDED.sma60,
+                cci30 = EXCLUDED.cci30,
+                dx30 = EXCLUDED.dx30
+        """
+        
+        execute_values(cursor, insert_query, records, page_size=1000)
+        
+        # Log processing run if stats provided
+        if stats:
+            cursor.execute("""
+                INSERT INTO processing_runs (year, files_processed, total_csv_rows, 
+                                            tickers_processed, final_df_rows, success)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (year, 
+                  stats.get('files_processed', 0), 
+                  stats.get('total_csv_rows', 0),
+                  stats.get('tickers_processed', 0), 
+                  stats.get('final_df_rows', 0),
+                  True))
+        
+        conn.commit()
+        print_success(f"Written {len(df)} rows to PostgreSQL for year {year}")
+        
+        cursor.close()
+        conn.close()
+        
+        return {'rows_written': len(df), 'year': year, 'success': True}
+        
+    except Exception as e:
+        print_error(f"PostgreSQL write failed: {e}")
+        if 'conn' in locals():
+            conn.rollback()
+            conn.close()
+        return {'success': False, 'error': str(e)}
+
+def choose_storage_backend(year: int, df: pd.DataFrame, config: Dict[str, Any], stats: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    Route data to appropriate storage backends based on configuration.
+    
+    Args:
+        year: Year being processed
+        df: DataFrame to write
+        config: Configuration dict with storage backend settings
+        stats: Optional processing statistics
+        
+    Returns:
+        Dictionary with results from each backend
+    """
+    backends = config.get('storage_backends', ['minio'])
+    results = {}
+    
+    if 'minio' in backends:
+        minio = config.get('minio_client')
+        if minio:
+            try:
+                results['minio'] = write_to_minio(df, year, minio)
+            except Exception as e:
+                print_error(f"MinIO write failed: {e}")
+                results['minio'] = {'success': False, 'error': str(e)}
+        else:
+            print_warning("MinIO client not provided in config")
+            results['minio'] = None
+    
+    if 'postgres' in backends:
+        postgres_conn = config.get('postgres_conn')
+        if postgres_conn or os.getenv('POSTGRES_CONN'):
+            try:
+                results['postgres'] = write_to_postgres(df, year, postgres_conn, stats)
+            except Exception as e:
+                print_error(f"PostgreSQL write failed: {e}")
+                results['postgres'] = {'success': False, 'error': str(e)}
+        else:
+            print_warning("PostgreSQL connection not configured")
+            results['postgres'] = None
+    
+    return results
 
 def validate_row_counts(stats):
     """Validate that row counts are consistent throughout processing"""
